@@ -989,11 +989,19 @@ def build_pred_locs_path(path_meta_template: str | os.PathLike,dir_std_base: str
     )
     return Path(path_str)
 
-def rafts_save_algo_dir_struct(dir_base: str | os.PathLike ) -> dict:
+def rafts_save_algo_dir_struct(dir_base: str | os.PathLike, region: Optional[str] = None,
+                                scheme: Optional[str] = None) -> dict:
     """Generate a standard file saving directory structure
 
     :param dir_base: The base directory for saving output
     :type dir_base: str | os.PathLike
+    :param region: Region identifier to nest output under, or None (default) for today's
+        unregioned layout. Ignored unless `scheme` is also given.
+    :type region: Optional[str]
+    :param scheme: Region scheme name (e.g. 'vpu'|'huc2'|'states'|'custom'), used only to
+        build the nesting path's directory name. None (default) reproduces today's layout
+        exactly, regardless of `region`.
+    :type scheme: Optional[str]
     :raises ValueError: If the base directory does not exist
     :return: Full paths to the `output`, `trained_algorithms`,
      `analysis` and `data_visualization` directories
@@ -1013,7 +1021,9 @@ def rafts_save_algo_dir_struct(dir_base: str | os.PathLike ) -> dict:
     # Define the standardized directory structure for algorithm output
     # base save directory, inside dir_base
     dir_out = Path(dir_base) / 'output'
-    dir_out.mkdir(exist_ok=True)
+    if scheme and region:
+        dir_out = dir_out / 'regions' / scheme / region
+    dir_out.mkdir(exist_ok=True, parents=True)
 
     # The trained algorithm directory
     dir_out_alg_base = Path(dir_out / Path('trained_algorithms'))
