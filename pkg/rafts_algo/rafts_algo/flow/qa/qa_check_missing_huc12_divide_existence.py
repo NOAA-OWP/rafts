@@ -54,13 +54,13 @@ Example:
                Everglades) are much bigger than a single HUC12, GL
 """
 import argparse
-import re
 import sys
 from pathlib import Path
 
 import pandas as pd
 import geopandas as gpd
 
+import rafts_algo.regions as raftsregions
 import rafts_algo.plots as raftsplot
 from rafts_algo.qa_utils import (
     resolve_qa_context, resolve_huc12_layer, resolve_divides_layer, find_huc12_divide_overlaps
@@ -203,8 +203,7 @@ def run(path_pred_config: Path, states: list = None, min_coverage_frac: float = 
 
     if states:
         states_norm = [s.strip().upper() for s in states]
-        state_pattern = '|'.join(rf'\b{re.escape(s)}\b' for s in states_norm)
-        gdf_region = gdf_huc12[gdf_huc12['states'].astype(str).str.contains(state_pattern, regex=True, na=False)]
+        gdf_region = gdf_huc12[raftsregions.states_mask(gdf_huc12, 'states', states_norm)]
         region_label = "-".join(states_norm)
     else:
         gdf_region = gdf_huc12[is_conus_huc12(gdf_huc12, huc12_col=huc12_col)]

@@ -359,6 +359,18 @@ class TestStatesMask(unittest.TestCase):
         self.assertEqual(list(mask), [True, False, False, False])
 
 
+class TestModelScopeSidecar(unittest.TestCase):
+
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raftsregions.write_model_scope_sidecar(tmpdir, region_id='EAST', model_scope='region_parent_fallback')
+            self.assertEqual(raftsregions.read_model_scope_sidecar(tmpdir), 'region_parent_fallback')
+
+    def test_missing_sidecar_returns_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(raftsregions.read_model_scope_sidecar(tmpdir, default='conus'), 'conus')
+
+
 class TestResolveRegionLoop(RegionsTestBase):
 
     def test_degenerate_case(self):

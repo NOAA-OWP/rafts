@@ -27,6 +27,7 @@ crosswalk-based schemes; callers filtering a `states`-columned layer should call
 :func:`states_mask` directly, exactly as the pre-existing code already did.
 """
 import dataclasses
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -637,6 +638,47 @@ def states_mask(gdf: Union[gpd.GeoDataFrame, pd.DataFrame], states_col: str,
     """
     state_pattern = '|'.join(rf'\b{re.escape(s)}\b' for s in region_states)
     return gdf[states_col].astype(str).str.contains(state_pattern, regex=True, na=False)
+
+
+def write_model_scope_sidecar(dir_out_alg_ds: Union[str, Path], region_id: str, model_scope: str) -> Path:
+    """Persist a region's resolved `model_scope` (e.g. 'region', 'region_parent_fallback')
+    next to its trained models, so a later script (e.g. the stitching step in
+    ``rafts_regn_params_gpkg.py``) can tag final output with it without re-deriving the
+    min_train_gages/fallback decision from scratch.
+
+    :param dir_out_alg_ds: The region+dataset's trained-algorithm directory (same directory
+        `std_algo_path` writes `.joblib` files into).
+    :type dir_out_alg_ds: str | os.PathLike
+    :param region_id: The region's identifier.
+    :type region_id: str
+    :param model_scope: The resolved model_scope to persist.
+    :type model_scope: str
+    :return: The sidecar file's path.
+    :rtype: Path
+    """
+    path_sidecar = Path(dir_out_alg_ds) / "model_scope.json"
+    path_sidecar.write_text(json.dumps({'region_id': region_id, 'model_scope': model_scope}))
+    return path_sidecar
+
+
+def read_model_scope_sidecar(dir_out_alg_ds: Union[str, Path], default: str = 'region') -> str:
+    """Read back the `model_scope` written by :func:`write_model_scope_sidecar`.
+
+    :param dir_out_alg_ds: The region+dataset's trained-algorithm directory to look in.
+    :type dir_out_alg_ds: str | os.PathLike
+    :param default: Value to return if no sidecar file is present (e.g. written before this
+        mechanism existed, or an unregioned run that never writes one), defaults to 'region'.
+    :type default: str, optional
+    :return: The persisted model_scope, or `default` if no sidecar exists.
+    :rtype: str
+    """
+    path_sidecar = Path(dir_out_alg_ds) / "model_scope.json"
+    if not path_sidecar.exists():
+        return default
+    try:
+        return json.loads(path_sidecar.read_text()).get('model_scope', default)
+    except (json.JSONDecodeError, OSError):
+        return default
 
 
 def resolve_region_loop(regions_cfg: Union[RegionsConfig, dict, None], cli_region_arg: Optional[str] = None,

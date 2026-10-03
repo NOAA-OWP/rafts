@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import geopandas as gpd
 import joblib
 import logging
 import matplotlib.pyplot as plt
@@ -34,6 +35,14 @@ import traceback
 
 # Set up basic logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Small-region safety floors: below these, GridSearchCV/MAPIE's cv or a clustering
+# algorithm's requested k would raise (or silently produce a degenerate result) rather than
+# train at all. The policy-level guard against this is rafts_algo.regions' min_train_gages/
+# fallback (applied before training even starts); these floors are the mechanical fallback
+# for whatever sample count training actually proceeds with.
+_MIN_CV_FOLDS = 2
+_MIN_SAMPLES_PER_CLUSTER = 2
 
 class AlgoTrainEval:
     def __init__(self, df: pd.DataFrame, attrs: Iterable[str], algo_config: dict,
@@ -269,6 +278,39 @@ class AlgoTrainEval:
             # e.g. {'activation':'relu'} becomes {'activation':['relu']}
             self.algo_config_grid  = self.convert_to_list(self.algo_config_grid)
 
+    def _capped_cv(self, requested_cv: int, n_samples: int) -> int:
+        """Cap a cross-validation fold count to what the current training set can support.
+
+        :param requested_cv: The configured (or default) number of CV folds.
+        :type requested_cv: int
+        :param n_samples: The number of samples available to fit on (``len(self.X_train)``).
+        :type n_samples: int
+        :return: `requested_cv`, capped to `n_samples` and floored at `_MIN_CV_FOLDS`.
+        :rtype: int
+        """
+        capped = max(_MIN_CV_FOLDS, min(requested_cv, n_samples))
+        if capped != requested_cv:
+            logging.warning(f"      Capping cv={requested_cv} to {capped} "
+                             f"(only {n_samples} training samples available).")
+        return capped
+
+    def _capped_n_clusters(self, requested_k: int, n_samples: int) -> int:
+        """Cap a cluster count to what the current training set can support.
+
+        :param requested_k: The configured (or default) number of clusters.
+        :type requested_k: int
+        :param n_samples: The number of samples available to fit on (``len(self.X_train)``).
+        :type n_samples: int
+        :return: `requested_k`, capped to ``max(1, n_samples // _MIN_SAMPLES_PER_CLUSTER)``.
+        :rtype: int
+        """
+        max_k = max(1, n_samples // _MIN_SAMPLES_PER_CLUSTER)
+        capped = min(requested_k, max_k)
+        if capped != requested_k:
+            logging.warning(f"      Capping n_clusters={requested_k} to {capped} "
+                             f"(only {n_samples} training samples available).")
+        return capped
+
     def calculate_forestci_uncertainty(self, forest, X_train, X_test):
         """
         Calculate uncertainty using forestci for a Random Forest model.
@@ -369,6 +411,8 @@ class AlgoTrainEval:
         """Generalized function to calculate prediction uncertainty using MAPIE."""
         mapie_method = next((d['method'] for d in self.uncertainty.get('mapie', []) if 'method' in d), None)
         mapie_cv = next((d['cv'] for d in self.uncertainty.get('mapie', []) if 'cv' in d), None)
+        if mapie_cv is not None:
+            mapie_cv = self._capped_cv(mapie_cv, len(self.X_train))
         mapie_agg_function = next((d['agg_function'] for d in self.uncertainty.get('mapie', []) if 'agg_function' in d), None)
         try:
             for algo_str, algo_data in self.algs_dict.items():
@@ -475,8 +519,9 @@ class AlgoTrainEval:
             n_clust = self.algo_config['kmeans'].get('n_clusters', 5)
             if isinstance(n_clust, list) and len(n_clust) == 1:
                 n_clust = int(n_clust[0])
+            n_clust = self._capped_n_clusters(n_clust, len(self.X_train))
 
-            kmeans = KMeans(n_clusters=n_clust, 
+            kmeans = KMeans(n_clusters=n_clust,
                             random_state=self.rs)
             pipe_kmeans = make_pipeline(StandardScaler(), kmeans)
             
@@ -494,6 +539,7 @@ class AlgoTrainEval:
             n_clust = self.algo_config['gower_agglomerative'].get('n_clusters', 5)
             if isinstance(n_clust, list) and len(n_clust) == 1:
                 n_clust = int(n_clust[0])
+            n_clust = self._capped_n_clusters(n_clust, len(self.X_train))
 
             # 1. Use Scikit-Learn's native Agglomerative Clustering
             # 'average' linkage is highly stable for mixed continuous/categorical hydrologic data
@@ -546,7 +592,7 @@ class AlgoTrainEval:
                 'randomforestregressor__min_samples_split': self.algo_config_grid['rf'].get('min_samples_split', [2, 5, 10])
             }
             pipe_rf = make_pipeline(rf)
-            grid_rf = GridSearchCV(pipe_rf, param_grid_rf, cv=5, scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
+            grid_rf = GridSearchCV(pipe_rf, param_grid_rf, cv=self._capped_cv(5, len(self.X_train)), scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
             
             grid_rf.fit(self.X_train, self.y_train)
 
@@ -572,7 +618,7 @@ class AlgoTrainEval:
                 'mlpregressor__max_iter': mlpcfg.get('max_iter', [200, 300])
             }
             pipe_mlp = make_pipeline(StandardScaler(), mlp)
-            grid_mlp = GridSearchCV(pipe_mlp, param_grid_mlp, cv=5, scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
+            grid_mlp = GridSearchCV(pipe_mlp, param_grid_mlp, cv=self._capped_cv(5, len(self.X_train)), scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
             grid_mlp.fit(self.X_train, self.y_train)
             self.algs_dict['mlp'] = {'algo': grid_mlp.best_estimator_,
                                     'pipeline': grid_mlp,
@@ -586,7 +632,7 @@ class AlgoTrainEval:
             hgbr = HistGradientBoostingRegressor(random_state=self.rs)
             param_grid_hgbr = {f'histgradientboostingregressor__{k}': v for k, v in self.algo_config_grid['hgbr'].items()}
             pipe_hgbr = make_pipeline(StandardScaler(), hgbr)
-            grid_hgbr = GridSearchCV(pipe_hgbr, param_grid_hgbr, cv=5, scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
+            grid_hgbr = GridSearchCV(pipe_hgbr, param_grid_hgbr, cv=self._capped_cv(5, len(self.X_train)), scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
             grid_hgbr.fit(self.X_train, self.y_train)
             self.algs_dict['hgbr'] = {'algo': grid_hgbr.best_estimator_.named_steps['histgradientboostingregressor'], 'pipeline': grid_hgbr, 'gridsearchcv': grid_hgbr, 'type': 'hist gradient boosting regressor', 'metric': self.metric, 'Uncertainty': {}}
 
@@ -595,7 +641,7 @@ class AlgoTrainEval:
             gbr = GradientBoostingRegressor(random_state=self.rs)
             param_grid_gbr = {f'gradientboostingregressor__{k}': v for k, v in self.algo_config_grid['gbr'].items()}
             pipe_gbr = make_pipeline(StandardScaler(), gbr)
-            grid_gbr = GridSearchCV(pipe_gbr, param_grid_gbr, cv=5, scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
+            grid_gbr = GridSearchCV(pipe_gbr, param_grid_gbr, cv=self._capped_cv(5, len(self.X_train)), scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
             grid_gbr.fit(self.X_train, self.y_train)
             self.algs_dict['gbr'] = {'algo': grid_gbr.best_estimator_.named_steps['gradientboostingregressor'], 'pipeline': grid_gbr, 'gridsearchcv': grid_gbr, 'type': 'gradient boosting regressor', 'metric': self.metric, 'Uncertainty': {}}
 
@@ -604,7 +650,7 @@ class AlgoTrainEval:
             ada = AdaBoostRegressor(random_state=self.rs)
             param_grid_ada = {f'adaboostregressor__{k}': v for k, v in self.algo_config_grid['adaboost'].items()}
             pipe_ada = make_pipeline(StandardScaler(), ada)
-            grid_ada = GridSearchCV(pipe_ada, param_grid_ada, cv=5, scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
+            grid_ada = GridSearchCV(pipe_ada, param_grid_ada, cv=self._capped_cv(5, len(self.X_train)), scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
             grid_ada.fit(self.X_train, self.y_train)
             self.algs_dict['adaboost'] = {'algo': grid_ada.best_estimator_.named_steps['adaboostregressor'], 'pipeline': grid_ada, 'gridsearchcv': grid_ada, 'type': 'adaboost regressor', 'metric': self.metric, 'Uncertainty': {}}
 
@@ -613,7 +659,7 @@ class AlgoTrainEval:
             xgb_model = xgb.XGBRegressor(random_state=self.rs, n_jobs=self.n_jobs)
             param_grid_xgb = {f'xgbregressor__{k}': v for k, v in self.algo_config_grid['xgb'].items()}
             pipe_xgb = make_pipeline(StandardScaler(), xgb_model)
-            grid_xgb = GridSearchCV(pipe_xgb, param_grid_xgb, cv=5, scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
+            grid_xgb = GridSearchCV(pipe_xgb, param_grid_xgb, cv=self._capped_cv(5, len(self.X_train)), scoring='neg_mean_absolute_error', n_jobs=self.n_jobs)
             grid_xgb.fit(self.X_train, self.y_train)
             self.algs_dict['xgb'] = {'algo': grid_xgb.best_estimator_.named_steps['xgbregressor'], 'pipeline': grid_xgb, 'gridsearchcv': grid_xgb, 'type': 'xgboost regressor', 'metric': self.metric, 'Uncertainty': {}}
         # --- CLUSTERING ALGORITHMS ---
@@ -624,7 +670,13 @@ class AlgoTrainEval:
                 logging.info(f"      Performing {alg_name} Clustering with Grid Search")
             
             cluster_sizes = self.algo_config_grid[alg_name].get('n_clusters', [3, 5, 8])
-            
+            max_k = max(1, len(self.X_train) // _MIN_SAMPLES_PER_CLUSTER)
+            filtered_sizes = [k for k in cluster_sizes if k <= max_k] or [max_k]
+            if filtered_sizes != list(cluster_sizes):
+                logging.warning(f"      Capping {alg_name} candidate cluster sizes {list(cluster_sizes)} "
+                                 f"to {filtered_sizes} (only {len(self.X_train)} training samples available).")
+            cluster_sizes = filtered_sizes
+
             best_score = -2.0
             best_model = None
             best_pipe = None
@@ -1352,73 +1404,160 @@ def _process_single_metric(args_dict):
         gc.collect()
 
 def assign_donors_to_receivers(
-    df_donors: pd.DataFrame, 
-    df_receivers: pd.DataFrame, 
-    attrs: list, 
+    df_donors: pd.DataFrame,
+    df_receivers: pd.DataFrame,
+    attrs: list,
     metric: str = 'euclidean',
     cluster_col: str = 'prediction',
-    id_col: str = 'featureID'
+    id_col: str = 'featureID',
+    max_spa_dist: float = None,
+    spatial_cols: tuple = ('lon', 'lat'),
+    spatial_crs: str = 'EPSG:4326',
 ) -> pd.DataFrame:
-    """
-    Pairs each receiver basin with the most similar donor basin within its assigned cluster.
-    Tracks and reports any receiver basins that fail to receive a donor assignment.
+    """Pairs each receiver basin with the most similar donor basin within its assigned
+    cluster. Tracks and reports any receiver basins that fail to receive a donor assignment.
+
+    :param df_donors: Donor basins, with `attrs`, `cluster_col`, `id_col`, and (only when
+        `max_spa_dist` is set) `spatial_cols`.
+    :type df_donors: pd.DataFrame
+    :param df_receivers: Receiver basins, with the same required columns as `df_donors`.
+    :type df_receivers: pd.DataFrame
+    :param attrs: Attribute columns defining the attribute-space distance.
+    :type attrs: list
+    :param metric: 'gower' or any :mod:`sklearn` pairwise-distance metric, defaults to
+        'euclidean'.
+    :type metric: str, optional
+    :param cluster_col: Column holding each row's assigned cluster, defaults to 'prediction'.
+    :type cluster_col: str, optional
+    :param id_col: Column identifying each row, defaults to 'featureID'.
+    :type id_col: str, optional
+    :param max_spa_dist: Optional maximum spatial distance (km) a receiver's assigned donor
+        may be from it. None (default) preserves the original attribute-only
+        nearest-neighbor behavior exactly -- the spatial ranking/fallback logic below is
+        skipped entirely, so every existing caller is unaffected. When set, each receiver
+        still prefers its attribute-nearest donor, but only among candidates within this
+        spatial distance; if none qualify, falls back to the plain attribute-nearest donor
+        regardless of distance (a receiver is never left unassigned just because every
+        in-cluster candidate was spatially far), and that fallback is tallied separately.
+        Defaults to None.
+    :type max_spa_dist: float, optional
+    :param spatial_cols: Column names holding (x, y)-style coordinates, used only when
+        `max_spa_dist` is set. Defaults to ('lon', 'lat').
+    :type spatial_cols: tuple, optional
+    :param spatial_crs: The CRS `spatial_cols` are expressed in; reprojected to EPSG:5070 for
+        a true-distance (km) comparison against `max_spa_dist`. Used only when `max_spa_dist`
+        is set. Defaults to 'EPSG:4326'.
+    :type spatial_crs: str, optional
+    :return: One row per paired receiver: receiver_id, donor_id, cluster_id,
+        distance_to_donor (attribute distance). When `max_spa_dist` is set, also
+        spatial_dist_to_donor_km and used_spatial_fallback.
+    :rtype: pd.DataFrame
     """
     pairing_results = []
-    
+    spatial_fallback_receivers = []
+
+    if max_spa_dist is not None:
+        # Reproject once, up front, rather than per-cluster -- the subsetting below
+        # (donors_in_clust/receivers_in_clust) carries these columns through naturally.
+        df_donors = df_donors.copy()
+        df_receivers = df_receivers.copy()
+        donor_pts = gpd.GeoSeries(gpd.points_from_xy(df_donors[spatial_cols[0]], df_donors[spatial_cols[1]]),
+                                   crs=spatial_crs).to_crs('EPSG:5070')
+        receiver_pts = gpd.GeoSeries(gpd.points_from_xy(df_receivers[spatial_cols[0]], df_receivers[spatial_cols[1]]),
+                                      crs=spatial_crs).to_crs('EPSG:5070')
+        df_donors['_spa_x'], df_donors['_spa_y'] = donor_pts.x.values, donor_pts.y.values
+        df_receivers['_spa_x'], df_receivers['_spa_y'] = receiver_pts.x.values, receiver_pts.y.values
+
     # Track initial receivers to verify completeness at the end
     initial_receivers = set(df_receivers[id_col])
-    
+
     # Identify receivers that missed predictions entirely (NaN values)
     unassigned_missing_cluster = df_receivers[df_receivers[cluster_col].isna()][id_col].tolist()
     if unassigned_missing_cluster:
         logging.warning(f"{len(unassigned_missing_cluster)} receivers have NaN cluster predictions and will be skipped.")
-    
+
     unique_clusters = df_receivers[cluster_col].dropna().unique()
     unassigned_empty_donor_cluster = []
-    
+
     for cluster_id in unique_clusters:
         donors_in_clust = df_donors[df_donors[cluster_col] == cluster_id].reset_index(drop=True)
         receivers_in_clust = df_receivers[df_receivers[cluster_col] == cluster_id].reset_index(drop=True)
-        
+
         if donors_in_clust.empty:
             logging.warning(f"No donors found for Cluster {cluster_id}. {len(receivers_in_clust)} receivers unassigned.")
             # Record the specific receivers that are dropped here
             unassigned_empty_donor_cluster.extend(receivers_in_clust[id_col].tolist())
             continue
-            
+
         X_donor = donors_in_clust[attrs]
         X_recv = receivers_in_clust[attrs]
-        
-        # Calculate Nearest Neighbor
-        if metric == 'gower':
-            dist_matrix = gower.gower_matrix(np.asarray(X_recv), np.asarray(X_donor))
-            closest_donor_indices = np.argmin(dist_matrix, axis=1)
-            distances = np.min(dist_matrix, axis=1)
+
+        if max_spa_dist is None:
+            # Calculate Nearest Neighbor
+            if metric == 'gower':
+                dist_matrix = gower.gower_matrix(np.asarray(X_recv), np.asarray(X_donor))
+                closest_donor_indices = np.argmin(dist_matrix, axis=1)
+                distances = np.min(dist_matrix, axis=1)
+            else:
+                nn = NearestNeighbors(n_neighbors=1, metric=metric)
+                nn.fit(X_donor)
+                distances, closest_donor_indices = nn.kneighbors(X_recv)
+                distances = distances.flatten()
+                closest_donor_indices = closest_donor_indices.flatten()
+
+            # Record the pairings
+            clust_pairings = pd.DataFrame({
+                'receiver_id': receivers_in_clust[id_col],
+                'donor_id': donors_in_clust.loc[closest_donor_indices, id_col].values,
+                'cluster_id': cluster_id,
+                'distance_to_donor': distances
+            })
         else:
-            nn = NearestNeighbors(n_neighbors=1, metric=metric)
-            nn.fit(X_donor)
-            distances, closest_donor_indices = nn.kneighbors(X_recv)
-            distances = distances.flatten()
-            closest_donor_indices = closest_donor_indices.flatten()
-            
-        # Record the pairings
-        clust_pairings = pd.DataFrame({
-            'receiver_id': receivers_in_clust[id_col],
-            'donor_id': donors_in_clust.loc[closest_donor_indices, id_col].values,
-            'cluster_id': cluster_id,
-            'distance_to_donor': distances
-        })
+            # Full attribute-distance matrix (receivers x donors) -- each receiver ranks
+            # every in-cluster donor by attribute distance, rather than only ever seeing the
+            # single nearest one, so it can walk down that ranking until a spatially-eligible
+            # candidate is found.
+            if metric == 'gower':
+                dist_matrix = gower.gower_matrix(np.asarray(X_recv), np.asarray(X_donor))
+            else:
+                dist_matrix = pairwise_distances(np.asarray(X_recv), np.asarray(X_donor), metric=metric)
+
+            donor_x, donor_y = donors_in_clust['_spa_x'].values, donors_in_clust['_spa_y'].values
+            recv_x, recv_y = receivers_in_clust['_spa_x'].values, receivers_in_clust['_spa_y'].values
+
+            donor_ids_sel, attr_dists_sel, spa_dists_sel, used_fallback = [], [], [], []
+            for i in range(len(receivers_in_clust)):
+                order = np.argsort(dist_matrix[i])
+                spa_dists_row_km = np.sqrt((donor_x - recv_x[i]) ** 2 + (donor_y - recv_y[i]) ** 2) / 1000.0
+                within_range = [j for j in order if spa_dists_row_km[j] <= max_spa_dist]
+                chosen = within_range[0] if within_range else order[0]
+                used_fallback.append(not within_range)
+                donor_ids_sel.append(donors_in_clust.loc[chosen, id_col])
+                attr_dists_sel.append(dist_matrix[i, chosen])
+                spa_dists_sel.append(spa_dists_row_km[chosen])
+
+            clust_pairings = pd.DataFrame({
+                'receiver_id': receivers_in_clust[id_col].values,
+                'donor_id': donor_ids_sel,
+                'cluster_id': cluster_id,
+                'distance_to_donor': attr_dists_sel,
+                'spatial_dist_to_donor_km': spa_dists_sel,
+                'used_spatial_fallback': used_fallback,
+            })
+            spatial_fallback_receivers.extend(
+                rid for rid, fb in zip(receivers_in_clust[id_col].values, used_fallback) if fb)
+
         pairing_results.append(clust_pairings)
-        
+
     if pairing_results:
         df_final_pairings = pd.concat(pairing_results, ignore_index=True)
     else:
         df_final_pairings = pd.DataFrame()
-        
+
     # --- Final Reconciliation and Reporting ---
     paired_receivers = set(df_final_pairings['receiver_id']) if not df_final_pairings.empty else set()
     missed_receivers = initial_receivers - paired_receivers
-    
+
     if missed_receivers:
         logging.warning(f"A total of {len(missed_receivers)} receivers were NOT assigned a donor.")
         if unassigned_empty_donor_cluster:
@@ -1427,7 +1566,12 @@ def assign_donors_to_receivers(
             logging.warning(f"Missed due to missing (NaN) cluster predictions: {unassigned_missing_cluster}")
     else:
         logging.info("All receivers were successfully assigned a donor.")
-        
+
+    if max_spa_dist is not None and spatial_fallback_receivers:
+        logging.warning(f"{len(spatial_fallback_receivers)} receiver(s) had no donor within "
+                         f"max_spa_dist={max_spa_dist}km; paired to the attribute-nearest donor "
+                         f"regardless of distance instead.")
+
     return df_final_pairings
 
 

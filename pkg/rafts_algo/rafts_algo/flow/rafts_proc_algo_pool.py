@@ -286,6 +286,7 @@ if __name__ == "__main__":
 
                 gdf_comid = gdf_comid_region
                 locids_resp = gdf_comid[col_locid].tolist()
+                raftsregions.write_model_scope_sidecar(dir_out_alg_ds, region_id, model_scope)
 
                 # test_ids is narrowed to this region's CORE only (never the buffer) -- no
                 # model is ever scored on a gage that was only extra training data for

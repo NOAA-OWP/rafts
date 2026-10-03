@@ -17,6 +17,7 @@ import argparse
 import pandas as pd
 from pathlib import Path
 import rafts_algo.utils as raftsutil
+import rafts_algo.regions as raftsregions
 import rafts_algo.plots as raftsplot
 import geopandas as gpd
 import logging
@@ -31,6 +32,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = 'process the prediction config file')
     parser.add_argument('path_pred_config', type=str, help='Path to the YAML configuration file specific for prediction.')
     parser.add_argument('--analysis_str', type=str, default='',required=False) # The string to add on to end of each plotting file name
+    parser.add_argument('--region', type=str, default=None,
+                         help="Restrict this run to a single configured sub-region's region_id. "
+                              "Omit to loop over every resolved sub-region, or run once "
+                              "unregioned if `regions:` isn't set.")
     args = parser.parse_args()
 
     path_pred_config = Path(args.path_pred_config).expanduser() 
@@ -74,9 +79,10 @@ if __name__ == "__main__":
     home_dir = attr_cfig.attrs_cfg_dict.get('home_dir')
     datasets = attr_cfig.attrs_cfg_dict.get('datasets')
 
-    dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base)
-    dir_out_viz_base = dirs_std_dict.get('dir_out_viz_base')
-    dir_out = dirs_std_dict.get('dir_out')
+    regions_cfg = validated_pred_cfg.regions  # None unless this config sets a `regions:` block
+    region_loop = raftsregions.resolve_region_loop(
+        regions_cfg, args.region, context={'home_dir': home_dir, 'dir_base': dir_base})
+    region_scheme = regions_cfg.scheme if regions_cfg else None
 
     # ---------- Generate path to the log file & initialize logging -----------
     path_log = pem.std_path_log(dir_input=dir_base, path_config=path_pred_config, script='rafts_map_pred')
@@ -158,133 +164,138 @@ if __name__ == "__main__":
         if 'featureID' not in gdf_all.columns:
             logging.error(f'Expecting featureID column to be in the gdf_all geodataframe')
 
-        for metr in resp_vars:
-            dir_preds_ds = Path(dir_out) / 'algorithm_predictions' / ds
-            dynamic_algos = raftsutil.discover_dynamic_algos(
-                search_dir=dir_preds_ds,
-                base_algos=algos,
-                metric=metr,
-                dataset_id=ds,
-                file_prefix="pred_",
-                file_extension=".parquet"
-            )
+        for region_id, region_spec in region_loop:
+            dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=region_scheme)
+            dir_out_viz_base = dirs_std_dict.get('dir_out_viz_base')
+            dir_out = dirs_std_dict.get('dir_out')
+
+            for metr in resp_vars:
+                dir_preds_ds = Path(dir_out) / 'algorithm_predictions' / ds
+                dynamic_algos = raftsutil.discover_dynamic_algos(
+                    search_dir=dir_preds_ds,
+                    base_algos=algos,
+                    metric=metr,
+                    dataset_id=ds,
+                    file_prefix="pred_",
+                    file_extension=".parquet"
+                )
             
-            if not dynamic_algos:
-                logging.warning(f"No prediction files found for {metr} to map. Skipping.")
-                continue
-
-            for algo_str in dynamic_algos:
-                logging.info(f"Generating prediction map for dataset: {ds}\nAlgorithm: {algo_str}\nResponse variable: {metr}")
-                
-                path_pred_in = raftsutil.std_pred_path(dir_out=dir_out,algo=algo_str,metric=metr,dataset_id=ds)
-                
-                if not Path(path_pred_in).exists():
-                    logging.warning(f"Prediction file not found: {path_pred_in}. Skipping.")
+                if not dynamic_algos:
+                    logging.warning(f"No prediction files found for {metr} to map. Skipping.")
                     continue
-                    
-                df_pred = pd.read_parquet(path_pred_in)
 
-                possible_joins = [('featureID', 'featureID'), ('divide_id', 'featureID'), ('comid', 'featureID')]
-                join_col_gpkg = None
+                for algo_str in dynamic_algos:
+                    logging.info(f"Generating prediction map for dataset: {ds}\nAlgorithm: {algo_str}\nResponse variable: {metr}")
                 
-                for gpkg_c, pred_c in possible_joins:
-                    if gpkg_c in gdf_all.columns and pred_c in df_pred.columns:
-                        join_col_gpkg = gpkg_c
-                        break
+                    path_pred_in = raftsutil.std_pred_path(dir_out=dir_out,algo=algo_str,metric=metr,dataset_id=ds)
+                
+                    if not Path(path_pred_in).exists():
+                        logging.warning(f"Prediction file not found: {path_pred_in}. Skipping.")
+                        continue
+                    
+                    df_pred = pd.read_parquet(path_pred_in)
+
+                    possible_joins = [('featureID', 'featureID'), ('divide_id', 'featureID'), ('comid', 'featureID')]
+                    join_col_gpkg = None
+                
+                    for gpkg_c, pred_c in possible_joins:
+                        if gpkg_c in gdf_all.columns and pred_c in df_pred.columns:
+                            join_col_gpkg = gpkg_c
+                            break
                         
-                if not join_col_gpkg:
-                    logging.error(f"Could not find matching ID columns to join GPKG {gdf_all.columns.tolist()} and Preds {df_pred.columns.tolist()}")
-                    continue
+                    if not join_col_gpkg:
+                        logging.error(f"Could not find matching ID columns to join GPKG {gdf_all.columns.tolist()} and Preds {df_pred.columns.tolist()}")
+                        continue
 
-                gdf_all[join_col_gpkg] = gdf_all[join_col_gpkg].astype(str)
-                df_pred['featureID'] = df_pred['featureID'].astype(str)
+                    gdf_all[join_col_gpkg] = gdf_all[join_col_gpkg].astype(str)
+                    df_pred['featureID'] = df_pred['featureID'].astype(str)
 
-                gdf_pred = gdf_all.merge(df_pred, how='inner', left_on=join_col_gpkg, right_on='featureID')
+                    gdf_pred = gdf_all.merge(df_pred, how='inner', left_on=join_col_gpkg, right_on='featureID')
                 
-                if gdf_pred.empty:
-                    logging.error("Merge resulted in an empty GeoDataFrame. IDs did not match.")
-                    continue
+                    if gdf_pred.empty:
+                        logging.error("Merge resulted in an empty GeoDataFrame. IDs did not match.")
+                        continue
 
-                # =========================================================================
-                # HELPER: Execution sequence for map plotting
-                # =========================================================================
-                def execute_mapping(gdf_to_plot, current_analysis_str, gdf_missing=None):
-                    logging.info(f"Plotting predictions for {current_analysis_str}")
-                    raftsplot.plot_map_pred_wrap(
-                        test_gdf=gdf_to_plot,
-                        dir_out_viz_base=dir_out_viz_base,
-                        ds=ds, metr=metr, algo_str=algo_str,
-                        split_type=current_analysis_str,
-                        colname_data='prediction', epsg_reproj=3857, task_type=task_type,
-                        gdf_missing=gdf_missing
-                    )
+                    # =========================================================================
+                    # HELPER: Execution sequence for map plotting
+                    # =========================================================================
+                    def execute_mapping(gdf_to_plot, current_analysis_str, gdf_missing=None):
+                        logging.info(f"Plotting predictions for {current_analysis_str}")
+                        raftsplot.plot_map_pred_wrap(
+                            test_gdf=gdf_to_plot,
+                            dir_out_viz_base=dir_out_viz_base,
+                            ds=ds, metr=metr, algo_str=algo_str,
+                            split_type=current_analysis_str,
+                            colname_data='prediction', epsg_reproj=3857, task_type=task_type,
+                            gdf_missing=gdf_missing
+                        )
                     
-                    mapie_alphas = raftsutil.infer_mapie_alphas(gdf_to_plot.columns)
-                    for alpha_val in mapie_alphas:
-                        logging.info(f"Generating MAPIE uncertainty map for alpha={alpha_val}")
-                        raftsplot.plot_map_pred_wrap_uncn(
-                            test_gdf=gdf_to_plot, dir_out_viz_base=dir_out_viz_base, 
-                            ds=ds, metr=metr, algo_str=algo_str, alpha_val=alpha_val, uncn_col=None,
-                            split_type=current_analysis_str, colname_data='prediction', epsg_reproj=3857
-                        )
+                        mapie_alphas = raftsutil.infer_mapie_alphas(gdf_to_plot.columns)
+                        for alpha_val in mapie_alphas:
+                            logging.info(f"Generating MAPIE uncertainty map for alpha={alpha_val}")
+                            raftsplot.plot_map_pred_wrap_uncn(
+                                test_gdf=gdf_to_plot, dir_out_viz_base=dir_out_viz_base, 
+                                ds=ds, metr=metr, algo_str=algo_str, alpha_val=alpha_val, uncn_col=None,
+                                split_type=current_analysis_str, colname_data='prediction', epsg_reproj=3857
+                            )
 
-                    if 'forestci' in gdf_to_plot.columns:
-                        logging.info("Generating ForestCI uncertainty map")
-                        raftsplot.plot_map_pred_wrap_uncn(
-                            test_gdf=gdf_to_plot, dir_out_viz_base=dir_out_viz_base, 
-                            ds=ds, metr=metr, algo_str=algo_str, alpha_val=None, uncn_col='forestci',
-                            split_type=current_analysis_str, colname_data='prediction', epsg_reproj=3857
-                        )
-                    del gdf_to_plot
-                    gc.collect()
-                # -----------------------------------------------------
-                # 1. PLOT PRIMARY GEOMETRY
-                # -----------------------------------------------------
-                execute_mapping(gdf_pred, analysis_str)
+                        if 'forestci' in gdf_to_plot.columns:
+                            logging.info("Generating ForestCI uncertainty map")
+                            raftsplot.plot_map_pred_wrap_uncn(
+                                test_gdf=gdf_to_plot, dir_out_viz_base=dir_out_viz_base, 
+                                ds=ds, metr=metr, algo_str=algo_str, alpha_val=None, uncn_col='forestci',
+                                split_type=current_analysis_str, colname_data='prediction', epsg_reproj=3857
+                            )
+                        del gdf_to_plot
+                        gc.collect()
+                    # -----------------------------------------------------
+                    # 1. PLOT PRIMARY GEOMETRY
+                    # -----------------------------------------------------
+                    execute_mapping(gdf_pred, analysis_str)
 
-                # -----------------------------------------------------
-                # 2. PLOT SECONDARY GEOMETRY (DIVIDES via CROSSWALK)
-                # -----------------------------------------------------
-                if df_crosswalk is not None and gdf_divides is not None and desired_id_col:
-                    logging.info("Crosswalk and master GPKG found. Generating secondary divide-level map.")
+                    # -----------------------------------------------------
+                    # 2. PLOT SECONDARY GEOMETRY (DIVIDES via CROSSWALK)
+                    # -----------------------------------------------------
+                    if df_crosswalk is not None and gdf_divides is not None and desired_id_col:
+                        logging.info("Crosswalk and master GPKG found. Generating secondary divide-level map.")
 
-                    # Broadcast the aggregated predictions down to the divide scale.
-                    # NOTE: left (not inner) merges here on purpose -- an inner merge
-                    # silently drops every divide_id absent from df_crosswalk, with no
-                    # record of how many or which ones were lost (only an all-or-nothing
-                    # gdf_pred_divides.empty check below). A real gap like this was
-                    # found and confirmed empirically: 13,952 of 555,866 divides in the
-                    # master GPKG (2.5%) have no entry at all in the huc12 crosswalk, so
-                    # their huc12 parent's cluster prediction (which does exist) never
-                    # reaches them -- they used to vanish from the map without a trace,
-                    # even though "the predictions populate cluster values for all
-                    # divides" upstream of this broadcast step.
-                    df_pred_mapped = df_pred.merge(df_crosswalk, left_on='featureID', right_on=pred_gpkg_id_col, how='left')
-                    n_pred_unmatched = df_pred_mapped[desired_id_col].isna().sum()
-                    if n_pred_unmatched:
-                        logging.warning(
-                            f"{n_pred_unmatched} of {len(df_pred_mapped)} predicted {pred_gpkg_id_col} "
-                            f"rows have no {desired_id_col} in the crosswalk and cannot be broadcast to divides."
-                        )
+                        # Broadcast the aggregated predictions down to the divide scale.
+                        # NOTE: left (not inner) merges here on purpose -- an inner merge
+                        # silently drops every divide_id absent from df_crosswalk, with no
+                        # record of how many or which ones were lost (only an all-or-nothing
+                        # gdf_pred_divides.empty check below). A real gap like this was
+                        # found and confirmed empirically: 13,952 of 555,866 divides in the
+                        # master GPKG (2.5%) have no entry at all in the huc12 crosswalk, so
+                        # their huc12 parent's cluster prediction (which does exist) never
+                        # reaches them -- they used to vanish from the map without a trace,
+                        # even though "the predictions populate cluster values for all
+                        # divides" upstream of this broadcast step.
+                        df_pred_mapped = df_pred.merge(df_crosswalk, left_on='featureID', right_on=pred_gpkg_id_col, how='left')
+                        n_pred_unmatched = df_pred_mapped[desired_id_col].isna().sum()
+                        if n_pred_unmatched:
+                            logging.warning(
+                                f"{n_pred_unmatched} of {len(df_pred_mapped)} predicted {pred_gpkg_id_col} "
+                                f"rows have no {desired_id_col} in the crosswalk and cannot be broadcast to divides."
+                            )
 
-                    gdf_pred_divides = gdf_divides.merge(df_pred_mapped, on=desired_id_col, how='left')
-                    missing_mask = gdf_pred_divides['prediction'].isna() if 'prediction' in gdf_pred_divides.columns else gdf_pred_divides[pred_gpkg_id_col].isna()
-                    gdf_missing_divides = gdf_pred_divides[missing_mask]
-                    gdf_pred_divides = gdf_pred_divides[~missing_mask]
-                    if not gdf_missing_divides.empty:
-                        logging.warning(
-                            f"{len(gdf_missing_divides)} of {len(gdf_divides)} divides in the master GPKG have "
-                            f"no matching prediction after the crosswalk broadcast (e.g. {gdf_missing_divides[desired_id_col].head(5).tolist()}); "
-                            f"rendering them as a distinct 'no crosswalk data' layer rather than leaving them blank."
-                        )
+                        gdf_pred_divides = gdf_divides.merge(df_pred_mapped, on=desired_id_col, how='left')
+                        missing_mask = gdf_pred_divides['prediction'].isna() if 'prediction' in gdf_pred_divides.columns else gdf_pred_divides[pred_gpkg_id_col].isna()
+                        gdf_missing_divides = gdf_pred_divides[missing_mask]
+                        gdf_pred_divides = gdf_pred_divides[~missing_mask]
+                        if not gdf_missing_divides.empty:
+                            logging.warning(
+                                f"{len(gdf_missing_divides)} of {len(gdf_divides)} divides in the master GPKG have "
+                                f"no matching prediction after the crosswalk broadcast (e.g. {gdf_missing_divides[desired_id_col].head(5).tolist()}); "
+                                f"rendering them as a distinct 'no crosswalk data' layer rather than leaving them blank."
+                            )
 
-                    if not gdf_pred_divides.empty:
-                        div_analysis_str = f"{analysis_str}_divides" if analysis_str else "divides"
-                        execute_mapping(gdf_pred_divides, div_analysis_str, gdf_missing=gdf_missing_divides)
-                    else:
-                        logging.warning("Divide-level merge resulted in an empty GeoDataFrame.")
+                        if not gdf_pred_divides.empty:
+                            div_analysis_str = f"{analysis_str}_divides" if analysis_str else "divides"
+                            execute_mapping(gdf_pred_divides, div_analysis_str, gdf_missing=gdf_missing_divides)
+                        else:
+                            logging.warning("Divide-level merge resulted in an empty GeoDataFrame.")
         
-        logging.info(f"Prediction map plots stored inside {dir_out_viz_base}")
+            logging.info(f"Prediction map plots stored inside {dir_out_viz_base}")
         logging.info(f"Completed prediction map generation for {path_pred_config}")
         
     logging.shutdown()

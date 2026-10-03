@@ -35,7 +35,6 @@ Usage:
                HUC12s dominated by a larger divide, instead of leaving them hatched, GL
 """
 import argparse
-import re
 import sys
 import logging
 from logging.handlers import MemoryHandler
@@ -45,39 +44,19 @@ import pandas as pd
 import geopandas as gpd
 
 import rafts_algo.utils as raftsutil
+import rafts_algo.regions as raftsregions
 import rafts_algo.plots as raftsplot
 import rafts_prep.proc_eval_metrics as pem
 from rafts_algo.qa_utils import resolve_divides_layer, find_huc12_divide_overlaps
 
 # Applied only when a prediction config has no `donor_map_states` key at all (a config
 # that sets it -- including to an empty value -- always takes precedence over this).
+# Unrelated to the sub-regional `regions:` config block (rafts_algo.regions) -- this is a
+# purely cosmetic display-grouping default for this map, not a training/pairing scope.
 DEFAULT_DONOR_MAP_REGIONS = {
     'FL': ['FL'],
     'PNW': ['WA', 'OR'],
 }
-
-
-def _normalize_donor_map_regions(donor_map_states_cfg) -> dict:
-    """Normalize the `donor_map_states` config value into ``{region_name: [state, ...]}``.
-
-    :param donor_map_states_cfg: Raw value from the prediction config: ``None`` (key
-     absent -- caller should apply :data:`DEFAULT_DONOR_MAP_REGIONS`), a falsy value
-     (explicit opt-out), a single state string, a flat list of state codes (one region,
-     named by joining the codes), or a dict of ``{region_name: state_or_states}``.
-    :type donor_map_states_cfg: None | str | list | dict
-    :return: ``{region_name: [2-letter state code, ...]}``, empty if opted out
-    :rtype: dict
-    """
-    if isinstance(donor_map_states_cfg, dict):
-        regions = {}
-        for name, states in donor_map_states_cfg.items():
-            states_list = [states] if isinstance(states, str) else list(states)
-            regions[str(name)] = [str(s).strip().upper() for s in states_list]
-        return regions
-
-    states_list = [donor_map_states_cfg] if isinstance(donor_map_states_cfg, str) else list(donor_map_states_cfg)
-    states_norm = [str(s).strip().upper() for s in states_list]
-    return {"-".join(states_norm): states_norm}
 
 
 def build_divide_proxy_receivers(gdf_no_pairing: gpd.GeoDataFrame, gdf_divides: gpd.GeoDataFrame,
@@ -177,6 +156,11 @@ def build_divide_proxy_receivers(gdf_no_pairing: gpd.GeoDataFrame, gdf_divides: 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Map donor-receiver pairings for one or more configured regions.')
     parser.add_argument('path_pred_config', type=str, help='Path to the YAML configuration file specific for prediction.')
+    parser.add_argument('--region', type=str, default=None,
+                         help="Restrict this run to a single configured sub-region's region_id "
+                              "(rafts_algo.regions; unrelated to donor_map_states below). Omit to "
+                              "loop over every resolved sub-region, or run once unregioned if "
+                              "`regions:` isn't set.")
     args = parser.parse_args()
 
     path_pred_config = Path(args.path_pred_config).expanduser()
@@ -223,7 +207,7 @@ if __name__ == "__main__":
         print(f"Skipping donor-receiver map for {path_pred_config.name}: {msg}")
         sys.exit(0)
     else:
-        regions = _normalize_donor_map_regions(donor_map_states_cfg)
+        regions = raftsregions.normalize_named_state_groups(donor_map_states_cfg)
 
     attr_cfig = raftsutil.AttrConfigAndVars(path_attr_config)
     attr_cfig._read_attr_config()
@@ -233,10 +217,10 @@ if __name__ == "__main__":
     home_dir = attr_cfig.attrs_cfg_dict.get('home_dir')
     datasets = attr_cfig.attrs_cfg_dict.get('datasets')
 
-    dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base)
-    dir_out = dirs_std_dict.get('dir_out')
-    dir_out_viz_base = dirs_std_dict.get('dir_out_viz_base')
-    dir_regionalization = Path(dir_out) / "regionalization"
+    regions_cfg = pred_cfg.pred_cfg_dict.get('regions')  # None unless this config sets a block
+    sub_region_loop = raftsregions.resolve_region_loop(
+        regions_cfg, args.region, context={'home_dir': home_dir, 'dir_base': dir_base})
+    sub_region_scheme = regions_cfg.get('scheme') if regions_cfg else None
 
     # ---------- Generate path to the log file & initialize logging -----------
     path_log = pem.std_path_log(dir_input=dir_base, path_config=path_pred_config, script='rafts_map_donor_receiver')
@@ -363,102 +347,107 @@ if __name__ == "__main__":
                                  f"Unpaired HUC12s will render as plain hatched gaps.")
                 gdf_divides_ds = None
 
-        dir_regn_ds = dir_regionalization / ds
-        for resp_var in resp_vars:
-            # Discover algos by which donor_pairs_*.csv files actually exist -- i.e. only
-            # algo variants where donor-receiver pairing actually ran and succeeded, not
-            # just the base algo strings listed in the config.
-            dynamic_algos = raftsutil.discover_dynamic_algos(
-                search_dir=dir_regn_ds, base_algos=algos, metric=resp_var,
-                dataset_id=ds, file_prefix="donor_pairs_", file_extension=".csv"
-            )
-            if not dynamic_algos:
-                logging.info(f"No donor_pairs files found for {resp_var} in {dir_regn_ds}; "
-                             f"skipping (pairing may not have been run yet for {ds}/{resp_var}).")
-                continue
+        for region_id, region_spec in sub_region_loop:
+            dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(
+                dir_base, region=region_id, scheme=sub_region_scheme)
+            dir_out = dirs_std_dict.get('dir_out')
+            dir_out_viz_base = dirs_std_dict.get('dir_out_viz_base')
+            dir_regionalization = Path(dir_out) / "regionalization"
 
-            for algo_str in dynamic_algos:
-                path_pairs = raftsutil.std_donor_pairs_path(dir_regionalization, ds, algo_str, resp_var)
-                if not path_pairs.exists():
-                    logging.warning(f"Donor pairs file not found: {path_pairs}. Skipping.")
+            dir_regn_ds = dir_regionalization / ds
+            for resp_var in resp_vars:
+                # Discover algos by which donor_pairs_*.csv files actually exist -- i.e. only
+                # algo variants where donor-receiver pairing actually ran and succeeded, not
+                # just the base algo strings listed in the config.
+                dynamic_algos = raftsutil.discover_dynamic_algos(
+                    search_dir=dir_regn_ds, base_algos=algos, metric=resp_var,
+                    dataset_id=ds, file_prefix="donor_pairs_", file_extension=".csv"
+                )
+                if not dynamic_algos:
+                    logging.info(f"No donor_pairs files found for {resp_var} in {dir_regn_ds}; "
+                                 f"skipping (pairing may not have been run yet for {ds}/{resp_var}).")
                     continue
 
-                # Read once per algo/response-var; region filtering below is cheap and
-                # avoids re-reading this file (up to several MB) once per region.
-                dp = pd.read_csv(path_pairs, dtype={'receiver_id': str, 'donor_id': str})
-                dp['receiver_id'] = dp['receiver_id'].str.zfill(12)
-                dp['donor_id'] = dp['donor_id'].str.zfill(8)
-                dp = dp.drop_duplicates('receiver_id')
-
-                for region_str, region_states in regions.items():
-                    state_pattern = '|'.join(rf'\b{re.escape(s)}\b' for s in region_states)
-                    gdf_region = gdf_recv_all[gdf_recv_all['states'].astype(str).str.contains(
-                        state_pattern, regex=True, na=False)]
-                    if gdf_region.empty:
-                        logging.warning(f"No {pred_gpkg_lyr} features matched region {region_str}={region_states} "
-                                         f"for {ds}. Skipping.")
+                for algo_str in dynamic_algos:
+                    path_pairs = raftsutil.std_donor_pairs_path(dir_regionalization, ds, algo_str, resp_var)
+                    if not path_pairs.exists():
+                        logging.warning(f"Donor pairs file not found: {path_pairs}. Skipping.")
                         continue
 
-                    region_pairs = dp[dp['receiver_id'].isin(set(gdf_region[pred_gpkg_id_col]))]
-                    if region_pairs.empty:
-                        logging.warning(f"No donor pairings matched region {region_str} for {ds}/{algo_str}/{resp_var}. Skipping.")
-                        continue
+                    # Read once per algo/response-var; region filtering below is cheap and
+                    # avoids re-reading this file (up to several MB) once per region.
+                    dp = pd.read_csv(path_pairs, dtype={'receiver_id': str, 'donor_id': str})
+                    dp['receiver_id'] = dp['receiver_id'].str.zfill(12)
+                    dp['donor_id'] = dp['donor_id'].str.zfill(8)
+                    dp = dp.drop_duplicates('receiver_id')
 
-                    gdf_region_run = gdf_region.merge(region_pairs[['receiver_id', 'cluster_id', 'donor_id']],
-                                                       left_on=pred_gpkg_id_col, right_on='receiver_id', how='left')
-                    gdf_region_run['cluster_id'] = gdf_region_run['cluster_id'].astype('Int64')
-                    gdf_no_pairing = gdf_region_run[gdf_region_run['cluster_id'].isna()]
+                    for region_str, region_states in regions.items():
+                        gdf_region = gdf_recv_all[raftsregions.states_mask(gdf_recv_all, 'states', region_states)]
+                        if gdf_region.empty:
+                            logging.warning(f"No {pred_gpkg_lyr} features matched region {region_str}={region_states} "
+                                             f"for {ds}. Skipping.")
+                            continue
 
-                    # Resolve as many of those unpaired HUC12s as possible into divide-shaped
-                    # proxy receivers (see build_divide_proxy_receivers) before locating donor
-                    # gages, so a borrowed donor from outside the region's own pairing set still
-                    # gets included below. Wrapped in try/except so this stays genuinely
-                    # best-effort (per the comment where gdf_divides_ds is loaded above) --
-                    # an unexpected failure here (e.g. unresolvable geometry) falls back to
-                    # plain hatched gaps for this one region/algo/resp_var instead of crashing
-                    # the whole run.
-                    gdf_proxy = gpd.GeoDataFrame(columns=['donor_id'], geometry=gpd.GeoSeries([], crs=gdf_region.crs))
-                    if gdf_divides_ds is not None and not gdf_no_pairing.empty:
-                        try:
-                            gdf_proxy, gdf_no_pairing = build_divide_proxy_receivers(
-                                gdf_no_pairing, gdf_divides_ds, divide_to_assigned_huc, divide_area_sqkm,
-                                dp, pred_gpkg_id_col, divide_id_col,
-                            )
-                        except Exception as e:
-                            logging.warning(f"Divide-proxy receiver resolution failed for {ds}/{algo_str}/"
-                                             f"{resp_var}/{region_str}: {e}. Falling back to plain hatched gaps.")
+                        region_pairs = dp[dp['receiver_id'].isin(set(gdf_region[pred_gpkg_id_col]))]
+                        if region_pairs.empty:
+                            logging.warning(f"No donor pairings matched region {region_str} for {ds}/{algo_str}/{resp_var}. Skipping.")
+                            continue
 
-                    donors_needed = set(region_pairs['donor_id']) | set(gdf_proxy['donor_id'].dropna())
-                    donors_pts = (hl_nwis_exp[hl_nwis_exp['gage_id'].isin(donors_needed)]
-                                  .drop_duplicates('gage_id')[['gage_id', 'geometry']].copy())
-                    missing_donor_ids = donors_needed - set(donors_pts['gage_id'])
-                    if missing_donor_ids:
-                        logging.warning(f"Could not locate {len(missing_donor_ids)} donor gage(s) in hydrolocations "
-                                         f"for {ds}/{algo_str}/{resp_var}/{region_str}: {sorted(missing_donor_ids)}")
+                        gdf_region_run = gdf_region.merge(region_pairs[['receiver_id', 'cluster_id', 'donor_id']],
+                                                           left_on=pred_gpkg_id_col, right_on='receiver_id', how='left')
+                        gdf_region_run['cluster_id'] = gdf_region_run['cluster_id'].astype('Int64')
+                        gdf_no_pairing = gdf_region_run[gdf_region_run['cluster_id'].isna()]
 
-                    gdf_valid = gdf_region_run[gdf_region_run['cluster_id'].notna()
-                                                & gdf_region_run['donor_id'].isin(donors_pts['gage_id'])].copy()
-                    gdf_valid['is_divide_proxy'] = False
-                    if not gdf_proxy.empty:
-                        gdf_proxy = gdf_proxy[gdf_proxy['donor_id'].isin(donors_pts['gage_id'])]
-                    if gdf_valid.empty and gdf_proxy.empty:
-                        logging.warning(f"No fully-locatable donor-receiver pairs for {ds}/{algo_str}/{resp_var} "
-                                         f"in region {region_str}. Skipping.")
-                        continue
+                        # Resolve as many of those unpaired HUC12s as possible into divide-shaped
+                        # proxy receivers (see build_divide_proxy_receivers) before locating donor
+                        # gages, so a borrowed donor from outside the region's own pairing set still
+                        # gets included below. Wrapped in try/except so this stays genuinely
+                        # best-effort (per the comment where gdf_divides_ds is loaded above) --
+                        # an unexpected failure here (e.g. unresolvable geometry) falls back to
+                        # plain hatched gaps for this one region/algo/resp_var instead of crashing
+                        # the whole run.
+                        gdf_proxy = gpd.GeoDataFrame(columns=['donor_id'], geometry=gpd.GeoSeries([], crs=gdf_region.crs))
+                        if gdf_divides_ds is not None and not gdf_no_pairing.empty:
+                            try:
+                                gdf_proxy, gdf_no_pairing = build_divide_proxy_receivers(
+                                    gdf_no_pairing, gdf_divides_ds, divide_to_assigned_huc, divide_area_sqkm,
+                                    dp, pred_gpkg_id_col, divide_id_col,
+                                )
+                            except Exception as e:
+                                logging.warning(f"Divide-proxy receiver resolution failed for {ds}/{algo_str}/"
+                                                 f"{resp_var}/{region_str}: {e}. Falling back to plain hatched gaps.")
 
-                    gdf_receivers = gpd.GeoDataFrame(
-                        pd.concat([gdf_valid, gdf_proxy], ignore_index=True), geometry='geometry', crs=gdf_valid.crs)
+                        donors_needed = set(region_pairs['donor_id']) | set(gdf_proxy['donor_id'].dropna())
+                        donors_pts = (hl_nwis_exp[hl_nwis_exp['gage_id'].isin(donors_needed)]
+                                      .drop_duplicates('gage_id')[['gage_id', 'geometry']].copy())
+                        missing_donor_ids = donors_needed - set(donors_pts['gage_id'])
+                        if missing_donor_ids:
+                            logging.warning(f"Could not locate {len(missing_donor_ids)} donor gage(s) in hydrolocations "
+                                             f"for {ds}/{algo_str}/{resp_var}/{region_str}: {sorted(missing_donor_ids)}")
 
-                    logging.info(f"Mapping donor-receiver pairing for {ds}/{algo_str}/{resp_var} in {region_str}: "
-                                 f"{len(gdf_receivers)} of {len(gdf_region)} receivers paired to "
-                                 f"{gdf_receivers['donor_id'].nunique()} donors "
-                                 f"({len(gdf_proxy)} via divide-shaped proxy).")
+                        gdf_valid = gdf_region_run[gdf_region_run['cluster_id'].notna()
+                                                    & gdf_region_run['donor_id'].isin(donors_pts['gage_id'])].copy()
+                        gdf_valid['is_divide_proxy'] = False
+                        if not gdf_proxy.empty:
+                            gdf_proxy = gdf_proxy[gdf_proxy['donor_id'].isin(donors_pts['gage_id'])]
+                        if gdf_valid.empty and gdf_proxy.empty:
+                            logging.warning(f"No fully-locatable donor-receiver pairs for {ds}/{algo_str}/{resp_var} "
+                                             f"in region {region_str}. Skipping.")
+                            continue
 
-                    raftsplot.plot_donor_receiver_map_wrap(
-                        gdf_receivers=gdf_receivers, gdf_donors=donors_pts, dir_out_viz_base=dir_out_viz_base,
-                        ds=ds, metr=resp_var, algo_str=algo_str, region_str=region_str,
-                        gdf_no_pairing=gdf_no_pairing,
-                    )
+                        gdf_receivers = gpd.GeoDataFrame(
+                            pd.concat([gdf_valid, gdf_proxy], ignore_index=True), geometry='geometry', crs=gdf_valid.crs)
+
+                        logging.info(f"Mapping donor-receiver pairing for {ds}/{algo_str}/{resp_var} in {region_str}: "
+                                     f"{len(gdf_receivers)} of {len(gdf_region)} receivers paired to "
+                                     f"{gdf_receivers['donor_id'].nunique()} donors "
+                                     f"({len(gdf_proxy)} via divide-shaped proxy).")
+
+                        raftsplot.plot_donor_receiver_map_wrap(
+                            gdf_receivers=gdf_receivers, gdf_donors=donors_pts, dir_out_viz_base=dir_out_viz_base,
+                            ds=ds, metr=resp_var, algo_str=algo_str, region_str=region_str,
+                            gdf_no_pairing=gdf_no_pairing,
+                        )
 
     logging.info(f"Completed donor-receiver map generation for {path_pred_config}")
     logging.shutdown()

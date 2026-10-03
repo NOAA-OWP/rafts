@@ -2030,6 +2030,75 @@ class TestAlgoTrainEvalClusteringGridSearchDefaults(unittest.TestCase):
         self.assertIn("Saved gower_agglomerative_k3", log_text)
 
 
+class TestAlgoTrainEvalSmallRegionCapping(unittest.TestCase):
+    """Covers _capped_cv/_capped_n_clusters -- the mechanical small-region safety net
+    complementing rafts_algo.regions' min_train_gages/fallback policy gate (which decides
+    *whether* a region trains at all; these caps make sure a region that *does* proceed with
+    few samples degrades gracefully instead of GridSearchCV/MAPIE/KMeans raising).
+    """
+
+    def setUp(self):
+        self.df = pd.DataFrame({
+            'comid': [f'id_{i}' for i in range(6)],
+            'attr1': [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            'attr2': [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            'metric1': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        })
+
+    def _make_algo(self, algo_config, task_type='regression', metr='metric1', uncertainty=None, **kwargs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dir_out_alg_ds = Path(tmpdir)
+        return raftsalgo.AlgoTrainEval(
+            df=self.df, attrs=['attr1', 'attr2'], algo_config=algo_config,
+            uncertainty=uncertainty or {}, dir_out_alg_ds=dir_out_alg_ds,
+            dataset_id='small_region_ds', metr=metr, task_type=task_type,
+            test_size=0.3, rs=42, test_id_col='comid', n_jobs=1, **kwargs
+        )
+
+    def test_capped_cv_helper_floors_and_caps(self):
+        algo = self._make_algo({'rf': [{'n_estimators': [10]}]})
+        self.assertEqual(algo._capped_cv(5, 4), 4)   # capped down to n_samples
+        self.assertEqual(algo._capped_cv(5, 1), 2)   # floored at _MIN_CV_FOLDS
+        self.assertEqual(algo._capped_cv(3, 10), 3)  # untouched when already small enough
+
+    def test_capped_n_clusters_helper_floors_and_caps(self):
+        algo = self._make_algo({'kmeans': [{'n_clusters': [5]}]}, task_type='clustering', metr='cluster_labels')
+        self.assertEqual(algo._capped_n_clusters(8, 6), 3)    # 6 // 2 == 3
+        self.assertEqual(algo._capped_n_clusters(8, 1), 1)    # floored at 1, never 0
+        self.assertEqual(algo._capped_n_clusters(2, 100), 2)  # untouched when already small enough
+
+    def test_grid_search_cv_does_not_raise_with_tiny_training_set(self):
+        # 6 rows, test_size=0.3 -> X_train has 4 samples; a literal cv=5 would raise
+        # "Cannot have number of splits n_splits=5 greater than the number of samples=4".
+        algo = self._make_algo({'rf': [{'n_estimators': [10, 20]}]})
+        algo.train_eval()
+        self.assertIn('rf', algo.algs_dict)
+        self.assertIn('gridsearchcv', algo.algs_dict['rf'])
+
+    def test_clustering_grid_search_does_not_raise_with_tiny_training_set(self):
+        # Requested candidate sizes [5, 8] both exceed what 4 training samples can support
+        # (max_k = 4 // 2 = 2); must fall back to [2] instead of raising.
+        algo = self._make_algo({'kmeans': [{'n_clusters': [5, 8]}]}, task_type='clustering', metr='cluster_labels')
+        algo.train_eval()
+        kmeans_keys = [k for k in algo.algs_dict if k.startswith('kmeans_k')]
+        self.assertEqual(kmeans_keys, ['kmeans_k2'])
+
+    def test_mapie_cv_is_capped(self):
+        # A configured MAPIE cv=10 exceeds the 4 available training samples; must be capped
+        # rather than raising "Invalid MAPIE method" (calculate_mapie's except ValueError
+        # would otherwise mislabel this exact failure mode). alpha=0.4 (rather than a tighter
+        # value like 0.1) keeps MAPIE's own separate internal "n_samples >= max(1/alpha,
+        # 1/(1-alpha))" fit-time constraint out of the way -- that constraint is independent
+        # of `cv` and isn't covered by this phase's capping (a known residual limitation for
+        # very small regions using tight alphas, out of this approved phase's scope).
+        algo = self._make_algo({'rf': [{'n_estimators': 10}]},
+                                uncertainty={'mapie': [{'method': 'plus', 'cv': 10, 'alpha': [0.4]}]})
+        with self.assertLogs(level='WARNING') as cm:
+            algo.train_eval()
+        self.assertTrue(any("Capping cv=10" in log for log in cm.output))
+        self.assertIn('mapie', algo.algs_dict['rf'])
+
+
 class TestAlgoTrainEvalSingleClusterPredicted(unittest.TestCase):
     """Covers evaluate_algos' branch for when only one cluster label is
     predicted on the test set (silhouette_score/davies_bouldin_score are
@@ -2869,6 +2938,74 @@ class TestAssignDonorsToReceivers(unittest.TestCase):
         # Validate that Gower matrix operations succeeded and returned populated distances
         self.assertEqual(len(result), 3)
         self.assertFalse(result['distance_to_donor'].isna().any())
+
+    def test_max_spa_dist_none_is_unchanged_from_default_signature(self):
+        """Backward compatibility: explicitly passing max_spa_dist=None must be identical to
+        not passing it at all (the pre-existing tests above already confirm the latter)."""
+        result_default = raftsalgo.assign_donors_to_receivers(
+            df_donors=self.df_donors, df_receivers=self.df_receivers, attrs=self.attrs,
+            metric='euclidean', cluster_col=self.cluster_col, id_col=self.id_col)
+        result_explicit_none = raftsalgo.assign_donors_to_receivers(
+            df_donors=self.df_donors, df_receivers=self.df_receivers, attrs=self.attrs,
+            metric='euclidean', cluster_col=self.cluster_col, id_col=self.id_col, max_spa_dist=None)
+        pd.testing.assert_frame_equal(result_default, result_explicit_none)
+        self.assertNotIn('spatial_dist_to_donor_km', result_default.columns)
+
+
+class TestAssignDonorsToReceiversMaxSpaDist(unittest.TestCase):
+    """max_spa_dist: a receiver prefers its attribute-nearest donor only among
+    spatially-eligible candidates, falling back to the plain attribute-nearest donor
+    (regardless of distance) when none qualify.
+    """
+
+    def setUp(self):
+        self.attrs = ['attr1', 'attr2']
+        self.id_col = 'featureID'
+        self.cluster_col = 'prediction'
+        # donor_near: attribute-distant from the receiver, but ~5.5km away spatially.
+        # donor_far_attr_match: attribute-identical to the receiver, but ~1400km away.
+        self.df_donors = pd.DataFrame({
+            self.id_col: ['donor_near', 'donor_far_attr_match'],
+            self.cluster_col: [1, 1],
+            'attr1': [5.0, 0.0],
+            'attr2': [5.0, 0.0],
+            'lon': [-100.0, -110.0],
+            'lat': [40.0, 45.0],
+        })
+        self.df_receivers = pd.DataFrame({
+            self.id_col: ['recv'],
+            self.cluster_col: [1],
+            'attr1': [0.1],
+            'attr2': [0.1],
+            'lon': [-100.05],
+            'lat': [40.05],
+        })
+
+    def test_without_max_spa_dist_picks_attribute_nearest_regardless_of_distance(self):
+        result = raftsalgo.assign_donors_to_receivers(
+            df_donors=self.df_donors, df_receivers=self.df_receivers, attrs=self.attrs,
+            cluster_col=self.cluster_col, id_col=self.id_col)
+        self.assertEqual(result.set_index('receiver_id')['donor_id']['recv'], 'donor_far_attr_match')
+
+    def test_with_max_spa_dist_prefers_spatially_eligible_donor(self):
+        result = raftsalgo.assign_donors_to_receivers(
+            df_donors=self.df_donors, df_receivers=self.df_receivers, attrs=self.attrs,
+            cluster_col=self.cluster_col, id_col=self.id_col,
+            max_spa_dist=50.0, spatial_cols=('lon', 'lat'))
+        row = result.set_index('receiver_id').loc['recv']
+        self.assertEqual(row['donor_id'], 'donor_near')
+        self.assertFalse(row['used_spatial_fallback'])
+        self.assertLessEqual(row['spatial_dist_to_donor_km'], 50.0)
+
+    def test_falls_back_to_attribute_nearest_when_none_spatially_eligible(self):
+        result = raftsalgo.assign_donors_to_receivers(
+            df_donors=self.df_donors, df_receivers=self.df_receivers, attrs=self.attrs,
+            cluster_col=self.cluster_col, id_col=self.id_col,
+            max_spa_dist=1.0, spatial_cols=('lon', 'lat'))
+        row = result.set_index('receiver_id').loc['recv']
+        self.assertEqual(row['donor_id'], 'donor_far_attr_match')
+        self.assertTrue(row['used_spatial_fallback'])
+
 
 class TestAlgoTrainEvalCoverage(unittest.TestCase):
     def setUp(self):
