@@ -44,6 +44,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 _MIN_CV_FOLDS = 2
 _MIN_SAMPLES_PER_CLUSTER = 2
 
+
+def _max_k_for_n_samples(n_samples: int) -> int:
+    """The largest cluster count a training set of this size can reasonably support.
+
+    :param n_samples: The number of samples available to fit on.
+    :type n_samples: int
+    :return: ``max(1, n_samples // _MIN_SAMPLES_PER_CLUSTER)``.
+    :rtype: int
+    """
+    return max(1, n_samples // _MIN_SAMPLES_PER_CLUSTER)
+
 class AlgoTrainEval:
     def __init__(self, df: pd.DataFrame, attrs: Iterable[str], algo_config: dict,
                  uncertainty: dict,
@@ -304,8 +315,7 @@ class AlgoTrainEval:
         :return: `requested_k`, capped to ``max(1, n_samples // _MIN_SAMPLES_PER_CLUSTER)``.
         :rtype: int
         """
-        max_k = max(1, n_samples // _MIN_SAMPLES_PER_CLUSTER)
-        capped = min(requested_k, max_k)
+        capped = min(requested_k, _max_k_for_n_samples(n_samples))
         if capped != requested_k:
             logging.warning(f"      Capping n_clusters={requested_k} to {capped} "
                              f"(only {n_samples} training samples available).")
@@ -670,7 +680,7 @@ class AlgoTrainEval:
                 logging.info(f"      Performing {alg_name} Clustering with Grid Search")
             
             cluster_sizes = self.algo_config_grid[alg_name].get('n_clusters', [3, 5, 8])
-            max_k = max(1, len(self.X_train) // _MIN_SAMPLES_PER_CLUSTER)
+            max_k = _max_k_for_n_samples(len(self.X_train))
             filtered_sizes = [k for k in cluster_sizes if k <= max_k] or [max_k]
             if filtered_sizes != list(cluster_sizes):
                 logging.warning(f"      Capping {alg_name} candidate cluster sizes {list(cluster_sizes)} "
@@ -1522,19 +1532,28 @@ def assign_donors_to_receivers(
             else:
                 dist_matrix = pairwise_distances(np.asarray(X_recv), np.asarray(X_donor), metric=metric)
 
-            donor_x, donor_y = donors_in_clust['_spa_x'].values, donors_in_clust['_spa_y'].values
-            recv_x, recv_y = receivers_in_clust['_spa_x'].values, receivers_in_clust['_spa_y'].values
+            donor_xy = donors_in_clust[['_spa_x', '_spa_y']].values
+            recv_xy = receivers_in_clust[['_spa_x', '_spa_y']].values
 
-            donor_ids_sel, attr_dists_sel, spa_dists_sel, used_fallback = [], [], [], []
-            for i in range(len(receivers_in_clust)):
-                order = np.argsort(dist_matrix[i])
-                spa_dists_row_km = np.sqrt((donor_x - recv_x[i]) ** 2 + (donor_y - recv_y[i]) ** 2) / 1000.0
-                within_range = [j for j in order if spa_dists_row_km[j] <= max_spa_dist]
-                chosen = within_range[0] if within_range else order[0]
-                used_fallback.append(not within_range)
-                donor_ids_sel.append(donors_in_clust.loc[chosen, id_col])
-                attr_dists_sel.append(dist_matrix[i, chosen])
-                spa_dists_sel.append(spa_dists_row_km[chosen])
+            # Full (receivers x donors) spatial-distance matrix via the same vectorized
+            # pairwise_distances call already used for the attribute-distance matrix above --
+            # replaces a per-receiver Python loop that re-derived the same shape with manual
+            # sqrt + argsort + a list comprehension.
+            spa_dist_matrix = pairwise_distances(recv_xy, donor_xy, metric='euclidean') / 1000.0
+            within_range_mask = spa_dist_matrix <= max_spa_dist
+            used_fallback = ~within_range_mask.any(axis=1)
+
+            # Attribute-nearest donor among spatially-eligible candidates (mask ineligible
+            # donors to +inf so argmin skips them); a receiver with none in range falls back
+            # to the plain attribute-nearest donor regardless of distance.
+            masked_dist_matrix = np.where(within_range_mask, dist_matrix, np.inf)
+            masked_dist_matrix[used_fallback] = dist_matrix[used_fallback]
+
+            chosen = np.argmin(masked_dist_matrix, axis=1)
+            row_idx = np.arange(len(receivers_in_clust))
+            donor_ids_sel = donors_in_clust[id_col].values[chosen]
+            attr_dists_sel = dist_matrix[row_idx, chosen]
+            spa_dists_sel = spa_dist_matrix[row_idx, chosen]
 
             clust_pairings = pd.DataFrame({
                 'receiver_id': receivers_in_clust[id_col].values,

@@ -181,6 +181,8 @@ if __name__ == "__main__":
     region_loop = raftsregions.resolve_region_loop(
         regions_cfg, args.region,
         context={'home_dir': attr_cfig.attrs_cfg_dict.get('home_dir'), 'dir_base': dir_base})
+    region_scheme = regions_cfg.scheme if regions_cfg else None
+    all_region_specs = [spec for _, spec in region_loop if spec is not None]
     #%% PREDICTION FILE'S COMIDS (IMPLICIT ASSUMPTION: Each dataset processes the same IDS)
     path_meta_pred = validated_pred_cfg.path_meta
     comid_pred_col = validated_pred_cfg.pred_file_comid_colname
@@ -251,11 +253,17 @@ if __name__ == "__main__":
                                                   else fio.get('featureSource', 'hf_id'))
 
             map_feat_srce_feat_id = df_attr_wide[['featureID','featureSource']].drop_duplicates()
-            df_attr_wide.set_index('featureID',inplace = True)    
-                
+            df_attr_wide.set_index('featureID',inplace = True)
+
+        # Region membership is a disjoint partition, so this is computed once for every
+        # configured region here rather than once per region inside the loop below --
+        # O(n) + O(num_regions) instead of O(num_regions * n) for a potentially large,
+        # CONUS-wide attribute index.
+        assigned_all = (raftsregions.assign_to_region(df_attr_wide.index.astype(str), all_region_specs)
+                         if all_region_specs else None)
+
         for region_id, region_spec in region_loop:
-            scheme = regions_cfg.scheme if regions_cfg else None
-            dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=scheme)
+            dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=region_scheme)
             dir_out = dirs_std_dict.get('dir_out')
             dir_out_alg_base = dirs_std_dict.get('dir_out_alg_base')
 
@@ -263,8 +271,7 @@ if __name__ == "__main__":
             # the buffer) -- predictions outside a region's own core are meaningless for a
             # model trained to represent exactly that core.
             if region_spec is not None:
-                assigned = raftsregions.assign_to_region(df_attr_wide.index.astype(str), [region_spec])
-                df_attr_wide_region = df_attr_wide[assigned.notna().values]
+                df_attr_wide_region = df_attr_wide[assigned_all.values == region_id]
                 if df_attr_wide_region.empty:
                     logging.info(f"No candidate receivers fall in region '{region_id}' for {ds}; skipping.")
                     continue

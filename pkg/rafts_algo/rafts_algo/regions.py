@@ -681,6 +681,96 @@ def read_model_scope_sidecar(dir_out_alg_ds: Union[str, Path], default: str = 'r
         return default
 
 
+def scope_training_set_to_region(
+    gdf_comid: Union[gpd.GeoDataFrame, pd.DataFrame],
+    gdf_comid_basin_rows: Union[gpd.GeoDataFrame, pd.DataFrame],
+    region_id: Optional[str],
+    region_spec: Optional[RegionSpec],
+    regions_cfg: Union[RegionsConfig, dict, None],
+    *,
+    gage_id_col: str,
+    divide_id_col: str,
+    dir_out_alg_ds: Union[str, Path],
+    ds: str,
+    test_ids: Optional[pd.Series] = None,
+) -> Tuple[Optional[Union[gpd.GeoDataFrame, pd.DataFrame]], Optional[pd.Series], str, Optional[RegionSpec]]:
+    """Restrict a training/donor set to one region's core+buffer, applying the
+    min_train_gages/fallback policy and narrowing `test_ids` to the region's core -- the one
+    region-scoping sequence every region-aware training script needs
+    (:func:`donor_gage_ids_for_region` -> :func:`apply_min_train_gages_fallback` ->
+    :func:`write_model_scope_sidecar` -> :func:`donor_gage_ids_for_region_core`), factored out
+    so it's defined once instead of once per training script.
+
+    :param gdf_comid: The dataset's full (region-unaware) training/donor set for this `ds`.
+    :type gdf_comid: gpd.GeoDataFrame | pd.DataFrame
+    :param gdf_comid_basin_rows: The same dataset's one-row-per-(gage_id, divide_id) basin
+        structure, read before any per-gage dedup -- see
+        :func:`assign_gages_by_basin_divides`'s docstring for why this must be the
+        pre-dedup frame.
+    :type gdf_comid_basin_rows: gpd.GeoDataFrame | pd.DataFrame
+    :param region_id: The current region's identifier, or None for the degenerate CONUS case.
+    :type region_id: Optional[str]
+    :param region_spec: The current region, or None for the degenerate CONUS case. When None,
+        this function is a no-op: returns `gdf_comid`/`test_ids` unchanged with
+        `model_scope='conus'`.
+    :type region_spec: Optional[RegionSpec]
+    :param regions_cfg: A validated RegionsConfig, a raw ``regions:`` dict, or None.
+    :type regions_cfg: RegionsConfig | dict | None
+    :param gage_id_col: Column in `gdf_comid`/`gdf_comid_basin_rows` holding the gage identifier.
+    :type gage_id_col: str
+    :param divide_id_col: Column in `gdf_comid_basin_rows` holding each row's divide identifier.
+    :type divide_id_col: str
+    :param dir_out_alg_ds: This region+dataset's trained-algorithm directory, for the
+        model_scope sidecar.
+    :type dir_out_alg_ds: str | os.PathLike
+    :param ds: The dataset identifier, used only for the skip-logging message.
+    :type ds: str
+    :param test_ids: The global (CONUS-wide) held-out test ids, or None if `same_test_ids` is
+        disabled. Narrowed to this region's core on return. Defaults to None.
+    :type test_ids: Optional[pd.Series]
+    :return: A 4-tuple: (the region-scoped training set, or None if `fallback='skip'` and the
+        region fell below `min_train_gages`; the narrowed `test_ids`; the resolved
+        `model_scope`; the region, possibly with a widened buffer from 'expand_buffer').
+    :rtype: tuple
+    """
+    if region_spec is None:
+        return gdf_comid, test_ids, 'conus', region_spec
+
+    regions_cfg = _as_regions_config(regions_cfg)
+    eligible_gage_ids = donor_gage_ids_for_region(
+        gdf_comid_basin_rows, region_spec, gage_id_col=gage_id_col, divide_id_col=divide_id_col)
+    gdf_comid_region = gdf_comid[gdf_comid[gage_id_col].astype(str).isin(eligible_gage_ids)]
+
+    if len(gdf_comid_region) < regions_cfg.min_train_gages:
+        eligible_fn = lambda r: donor_gage_ids_for_region(
+            gdf_comid_basin_rows, r, gage_id_col=gage_id_col, divide_id_col=divide_id_col)
+        gdf_comid_region, region_spec, model_scope = apply_min_train_gages_fallback(
+            region=region_spec, gdf_donors_core_buffer=gdf_comid_region,
+            gdf_donors_global=gdf_comid, min_train_gages=regions_cfg.min_train_gages,
+            fallback=regions_cfg.fallback, id_col=gage_id_col, eligible_ids_fn=eligible_fn)
+        if gdf_comid_region is None:  # fallback == 'skip'
+            logging.warning(f"Region '{region_id}'/{ds}: fewer than "
+                             f"{regions_cfg.min_train_gages} training gages available; "
+                             f"skipping (fallback='skip').")
+            return None, test_ids, 'skip', region_spec
+    else:
+        model_scope = 'region'
+
+    gdf_comid = gdf_comid_region
+    write_model_scope_sidecar(dir_out_alg_ds, region_id, model_scope)
+
+    # test_ids is narrowed to this region's CORE only (never the buffer) -- no model is ever
+    # scored on a gage that was only extra training data for another region's buffer.
+    if isinstance(test_ids, pd.Series):
+        core_gage_ids = donor_gage_ids_for_region_core(
+            gdf_comid_basin_rows, region_spec, gage_id_col=gage_id_col, divide_id_col=divide_id_col)
+        test_ids = gdf_comid[gage_id_col][
+            gdf_comid[gage_id_col].astype(str).isin(test_ids.astype(str))
+            & gdf_comid[gage_id_col].astype(str).isin(core_gage_ids)]
+
+    return gdf_comid, test_ids, model_scope, region_spec
+
+
 def resolve_region_loop(regions_cfg: Union[RegionsConfig, dict, None], cli_region_arg: Optional[str] = None,
                          **load_regions_kwargs) -> List[Tuple[Optional[str], Optional[RegionSpec]]]:
     """Resolve the (region_id, RegionSpec) pairs a flow script's outermost loop should iterate

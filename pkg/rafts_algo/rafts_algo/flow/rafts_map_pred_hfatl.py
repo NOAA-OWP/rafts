@@ -164,7 +164,7 @@ if __name__ == "__main__":
         if 'featureID' not in gdf_all.columns:
             logging.error(f'Expecting featureID column to be in the gdf_all geodataframe')
 
-        for region_id, region_spec in region_loop:
+        for region_id, _ in region_loop:  # region_spec unused here; only per-region output paths matter
             dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=region_scheme)
             dir_out_viz_base = dirs_std_dict.get('dir_out_viz_base')
             dir_out = dirs_std_dict.get('dir_out')

@@ -92,6 +92,8 @@ if __name__ == "__main__":
     regions_cfg = validated_pred_cfg.regions  # None unless this config sets a `regions:` block
     region_loop = raftsregions.resolve_region_loop(regions_cfg, args.region, context=context)
     region_divide_id_col = regions_cfg.divide_id_col if regions_cfg else 'divide_id'
+    region_scheme = regions_cfg.scheme if regions_cfg else None
+    max_spa_dist = regions_cfg.max_spa_dist_km if regions_cfg else None
 
     # Resolve Attributes using validated config
     name_attr_csv = validated_algo_cfg.name_attr_csv
@@ -111,6 +113,29 @@ if __name__ == "__main__":
 
     resp_vars = validated_pred_cfg.algo_response_vars
     algos = validated_pred_cfg.algo_type
+
+    # Receiver attribute metadata, and (only if spatial pairing is configured) receiver
+    # divide centroid coordinates, are both invariant across ds/region/resp_var/algo -- read
+    # once here rather than once per algo iteration below.
+    df_recv_attrs = raftsutil.read_hfatlas_wrap_dask(
+        paths_hfatl=[path_meta], attrs_sel=attrs_sel, map_id_col=id_col_pred)
+
+    recv_coords = None
+    if max_spa_dist is not None:
+        # The divides layer's own id column is PredConfig.map_divide_id_col (e.g.
+        # 'divide_id'), not literally 'featureID' -- but for the hfATLAS workflow, a
+        # receiver's 'featureID' (renamed from pred_file_comid_colname below) IS a divide_id
+        # value, so the two align once renamed.
+        recv_divide_id_col = validated_pred_cfg.map_divide_id_col
+        gdf_recv_divides = qa_utils.resolve_divides_layer(
+            {'path_hf_finl_gpkg': validated_pred_cfg.path_hf_finl_gpkg,
+             'layr_hf_finl_gpkg': validated_pred_cfg.layr_hf_finl_gpkg},
+            context, divide_id_col=recv_divide_id_col)
+        recv_coords = gdf_recv_divides.drop_duplicates(recv_divide_id_col).copy()
+        recv_centroids = recv_coords.geometry.centroid
+        recv_coords['lon'] = recv_centroids.x
+        recv_coords['lat'] = recv_centroids.y
+        recv_coords = recv_coords.rename(columns={recv_divide_id_col: 'featureID'})[['featureID', 'lon', 'lat']]
 
     # --- Processing ---
     for ds in datasets:
@@ -144,14 +169,24 @@ if __name__ == "__main__":
         gdf_comid_basin_rows = raftsutil.combine_resp_gdf_comid_wrap(
             dir_std_base=dir_std_base, ds=ds, path_attr_config=path_attr_config)['gdf_comid']
 
+        # Donor centroid coordinates for spatial pairing preference: depend only on this
+        # ds's gdf_comid_basin_rows, not on region/resp_var/algo -- computed once here
+        # instead of once per algo iteration below.
+        donor_coords = None
+        if max_spa_dist is not None:
+            donor_coords = (gdf_comid_basin_rows[['featureID', 'geometry']]
+                             .drop_duplicates('featureID').copy())
+            donor_coords['lon'] = donor_coords.geometry.x
+            donor_coords['lat'] = donor_coords.geometry.y
+            donor_coords = donor_coords[['featureID', 'lon', 'lat']]
+
         df_attr_donor = raftsutil.rafts_read_attr_comid(dir_db_attrs,
                                                   gage_ids_raw, attrs_sel=attrs_sel, read_type='all')
         df_donor_wide_all = df_attr_donor.pivot(index='featureID', columns='attribute', values='value').dropna()
         logging.info(f"Ingested donor attribute data. Total locations = {df_donor_wide_all.shape[0]}")
 
         for region_id, region_spec in region_loop:
-            scheme = regions_cfg.scheme if regions_cfg else None
-            dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=scheme)
+            dirs_std_dict = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=region_scheme)
             dir_out = dirs_std_dict.get('dir_out')
             dir_out_alg_base = dirs_std_dict.get('dir_out_alg_base')
             dir_regionalization = Path(dir_out) / "regionalization"
@@ -203,14 +238,8 @@ if __name__ == "__main__":
                     # Spatial pairing preference (optional): merge in donor centroid
                     # coordinates only when actually needed -- neither donor nor receiver
                     # dataframe carries a coordinate column otherwise.
-                    max_spa_dist = regions_cfg.max_spa_dist_km if regions_cfg else None
-                    if max_spa_dist is not None:
-                        donor_coords = (gdf_comid_basin_rows[['featureID', 'geometry']]
-                                         .drop_duplicates('featureID').copy())
-                        donor_coords['lon'] = donor_coords.geometry.x
-                        donor_coords['lat'] = donor_coords.geometry.y
-                        df_donors_paired = df_donors_paired.merge(
-                            donor_coords[['featureID', 'lon', 'lat']], on='featureID', how='left')
+                    if donor_coords is not None:
+                        df_donors_paired = df_donors_paired.merge(donor_coords, on='featureID', how='left')
 
                     # 3. Load RECEIVER Predictions (Ungauged Basins from rafts_pred_algo.py)
                     path_pred_in = raftsutil.std_pred_path(dir_out=dir_out, algo=algo, metric=resp_var, dataset_id=ds)
@@ -219,15 +248,9 @@ if __name__ == "__main__":
                         print(f"PROBLEM: No Receiver predictions from the prediction step!! {path_pred_in}")
                         continue
                 
-                    # Read the cluster predictions across all locations 
+                    # Read the cluster predictions across all locations
                     path_pred_out = raftsutil.std_pred_path(dir_out,algo=algo,metric=resp_var,dataset_id=ds)
                     df_receivers = pd.read_parquet(path_pred_out)
-                    df_recv_attrs = raftsutil.read_hfatlas_wrap_dask(
-                                        paths_hfatl=[path_meta], 
-                                        attrs_sel=attrs_sel, # Empty list forces it to only pull the map_id_col
-                                        map_id_col=id_col_pred#,query_clean=True
-                                        )
-                
 
                     if 'featureID' not in df_receivers.columns:
                         df_receivers.rename(columns={id_col_pred:'featureID'},inplace=True)
@@ -237,23 +260,8 @@ if __name__ == "__main__":
 
                     logging.info(f"Ingested receiver attribute data. Total locations = {df_receivers.shape[0]}")
 
-                    if max_spa_dist is not None:
-                        # The divides layer's own id column is PredConfig.map_divide_id_col
-                        # (e.g. 'divide_id'), not literally 'featureID' -- but for the hfATLAS
-                        # workflow, a receiver's 'featureID' (renamed from pred_file_comid_colname
-                        # above) IS a divide_id value, so the two align once renamed.
-                        divide_id_col = validated_pred_cfg.map_divide_id_col
-                        gdf_recv_divides = qa_utils.resolve_divides_layer(
-                            {'path_hf_finl_gpkg': validated_pred_cfg.path_hf_finl_gpkg,
-                             'layr_hf_finl_gpkg': validated_pred_cfg.layr_hf_finl_gpkg},
-                            context, divide_id_col=divide_id_col)
-                        recv_coords = gdf_recv_divides.drop_duplicates(divide_id_col).copy()
-                        recv_centroids = recv_coords.geometry.centroid
-                        recv_coords['lon'] = recv_centroids.x
-                        recv_coords['lat'] = recv_centroids.y
-                        recv_coords = recv_coords.rename(columns={divide_id_col: 'featureID'})
-                        df_receivers_mrge = df_receivers_mrge.merge(
-                            recv_coords[['featureID', 'lon', 'lat']], on='featureID', how='left')
+                    if recv_coords is not None:
+                        df_receivers_mrge = df_receivers_mrge.merge(recv_coords, on='featureID', how='left')
 
                     # 4. MISSING DATA IMPUTATION & CLUSTER ASSIGNMENT
                     nan_pred_mask = df_receivers_mrge['prediction'].isna()

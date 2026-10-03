@@ -177,8 +177,6 @@ if __name__ == "__main__":
         regions_cfg_raw, args.region,
         context={'home_dir': attr_cfig.attrs_cfg_dict.get('home_dir'), 'dir_base': dir_base})
     region_divide_id_col = (regions_cfg_raw or {}).get('divide_id_col', 'divide_id')
-    region_min_train_gages = (regions_cfg_raw or {}).get('min_train_gages', 1)
-    region_fallback = (regions_cfg_raw or {}).get('fallback', 'skip')
     region_scheme = (regions_cfg_raw or {}).get('scheme') if regions_cfg_raw else None
 
     for region_id, region_spec in region_loop:
@@ -244,39 +242,13 @@ if __name__ == "__main__":
                 locids_resp = gdf_comid[col_locid].tolist()
 
             # === Region scoping: restrict training/donor data to this region's core+buffer ===
-            model_scope = 'conus'
-            if region_spec is not None:
-                eligible_gage_ids = raftsregions.donor_gage_ids_for_region(
-                    gdf_comid_basin_rows, region_spec, gage_id_col=col_locid,
-                    divide_id_col=region_divide_id_col)
-                gdf_comid_region = gdf_comid[gdf_comid[col_locid].astype(str).isin(eligible_gage_ids)]
-
-                if len(gdf_comid_region) < region_min_train_gages:
-                    eligible_fn = lambda r: raftsregions.donor_gage_ids_for_region(
-                        gdf_comid_basin_rows, r, gage_id_col=col_locid, divide_id_col=region_divide_id_col)
-                    gdf_comid_region, region_spec, model_scope = raftsregions.apply_min_train_gages_fallback(
-                        region=region_spec, gdf_donors_core_buffer=gdf_comid_region,
-                        gdf_donors_global=gdf_comid, min_train_gages=region_min_train_gages,
-                        fallback=region_fallback, id_col=col_locid, eligible_ids_fn=eligible_fn)
-                    if gdf_comid_region is None:  # fallback == 'skip'
-                        logging.warning(f"Region '{region_id}'/{ds}: fewer than "
-                                        f"{region_min_train_gages} training gages available; "
-                                        f"skipping (fallback='skip').")
-                        continue
-                else:
-                    model_scope = 'region'
-
-                gdf_comid = gdf_comid_region
-                locids_resp = gdf_comid[col_locid].tolist()
-                raftsregions.write_model_scope_sidecar(dir_out_alg_ds, region_id, model_scope)
-
-                if isinstance(test_ids, pd.Series):
-                    core_gage_ids = raftsregions.donor_gage_ids_for_region_core(
-                        gdf_comid_basin_rows, region_spec, gage_id_col=col_locid,
-                        divide_id_col=region_divide_id_col)
-                    test_ids = gdf_comid[col_locid][
-                        gdf_comid[col_locid].astype(str).isin(test_ids.astype(str))
-                        & gdf_comid[col_locid].astype(str).isin(core_gage_ids)]
+            gdf_comid, test_ids, model_scope, region_spec = raftsregions.scope_training_set_to_region(
+                gdf_comid, gdf_comid_basin_rows, region_id, region_spec, regions_cfg_raw,
+                gage_id_col=col_locid, divide_id_col=region_divide_id_col,
+                dir_out_alg_ds=dir_out_alg_ds, ds=ds, test_ids=test_ids)
+            if gdf_comid is None:  # fallback == 'skip', logged inside scope_training_set_to_region
+                continue
+            locids_resp = gdf_comid[col_locid].tolist()
             # === end region scoping ===
 
             if not metrics:

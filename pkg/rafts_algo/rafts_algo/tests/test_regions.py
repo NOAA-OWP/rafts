@@ -185,6 +185,64 @@ class GageBasinTestBase(RegionsTestBase):
         })
 
 
+class TestScopeTrainingSetToRegion(GageBasinTestBase):
+    """Covers scope_training_set_to_region -- the shared region-scoping sequence factored
+    out of rafts_proc_algo_pool.py/rafts_proc_algo_viz.py (both call it identically)."""
+
+    def setUp(self):
+        super().setUp()
+        self.gdf_comid = pd.DataFrame({'gage_id': ['g1', 'g2', 'g3', 'g4']})
+        self.test_ids_global = pd.Series(['g1', 'g2', 'g3'], index=['g1', 'g2', 'g3'])
+
+    def test_region_spec_none_is_passthrough(self):
+        gdf_comid, test_ids, model_scope, region_spec = raftsregions.scope_training_set_to_region(
+            self.gdf_comid, self.df_basin_rows, None, None, self.regions_cfg,
+            gage_id_col='gage_id', divide_id_col='divide_id',
+            dir_out_alg_ds='/nonexistent', ds='test_ds', test_ids=self.test_ids_global)
+        pd.testing.assert_frame_equal(gdf_comid, self.gdf_comid)
+        self.assertIs(test_ids, self.test_ids_global)
+        self.assertEqual(model_scope, 'conus')
+        self.assertIsNone(region_spec)
+
+    def test_normal_scoping_narrows_gdf_comid_and_test_ids_to_core(self):
+        regions = raftsregions.load_regions(self.regions_cfg)
+        region_a = next(r for r in regions if r.region_id == 'A')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gdf_comid, test_ids, model_scope, _ = raftsregions.scope_training_set_to_region(
+                self.gdf_comid, self.df_basin_rows, 'A', region_a, self.regions_cfg,
+                gage_id_col='gage_id', divide_id_col='divide_id',
+                dir_out_alg_ds=tmpdir, ds='test_ds', test_ids=self.test_ids_global)
+            self.assertEqual(model_scope, 'region')
+            self.assertEqual(set(gdf_comid['gage_id']), {'g1', 'g2'})  # eligible donors for A
+            # g2's basin also touches region B, but it's still in A's CORE (d2/d3), so it
+            # stays in the core-only test_ids narrowing.
+            self.assertEqual(set(test_ids), {'g1', 'g2'})
+            self.assertEqual(raftsregions.read_model_scope_sidecar(tmpdir), 'region')
+
+    def test_fallback_skip_returns_none(self):
+        regions_cfg = self.regions_cfg.model_copy(update={'min_train_gages': 5, 'fallback': 'skip'})
+        regions = raftsregions.load_regions(regions_cfg)
+        region_a = next(r for r in regions if r.region_id == 'A')
+        gdf_comid, test_ids, model_scope, _ = raftsregions.scope_training_set_to_region(
+            self.gdf_comid, self.df_basin_rows, 'A', region_a, regions_cfg,
+            gage_id_col='gage_id', divide_id_col='divide_id',
+            dir_out_alg_ds='/nonexistent', ds='test_ds', test_ids=self.test_ids_global)
+        self.assertIsNone(gdf_comid)
+        self.assertEqual(model_scope, 'skip')
+
+    def test_fallback_parent_returns_global_set(self):
+        regions_cfg = self.regions_cfg.model_copy(update={'min_train_gages': 5, 'fallback': 'parent'})
+        regions = raftsregions.load_regions(regions_cfg)
+        region_a = next(r for r in regions if r.region_id == 'A')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gdf_comid, test_ids, model_scope, _ = raftsregions.scope_training_set_to_region(
+                self.gdf_comid, self.df_basin_rows, 'A', region_a, regions_cfg,
+                gage_id_col='gage_id', divide_id_col='divide_id',
+                dir_out_alg_ds=tmpdir, ds='test_ds', test_ids=self.test_ids_global)
+            self.assertEqual(model_scope, 'region_parent_fallback')
+            self.assertEqual(set(gdf_comid['gage_id']), {'g1', 'g2', 'g3', 'g4'})
+
+
 class TestAssignGagesByBasinDivides(GageBasinTestBase):
 
     def test_majority_vote_resolves_basin_spanning_gage(self):

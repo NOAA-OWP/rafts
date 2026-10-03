@@ -131,6 +131,26 @@ if __name__ == "__main__":
         logging.info(f"Initializing local Master GPKG by copying {path_hf_finl_gpkg.name} to {dest_master_path.parent}")
         shutil.copy2(path_hf_finl_gpkg, dest_master_path)
 
+    # Optional crosswalk mapping (supervised flow only): path_crosswalk_ids_raw/
+    # pred_gpkg_id_col_local/df_crosswalk/desired_id_col depend only on validated_pred_cfg and
+    # context, never on ds/region/algo -- resolved once here instead of once per
+    # (ds, region, algo) combination below.
+    path_crosswalk_ids_raw = validated_pred_cfg.path_crosswalk_ids
+    pred_gpkg_id_col_local = validated_pred_cfg.pred_gpkg_id_col
+    df_crosswalk = None
+    desired_id_col = None
+    if path_crosswalk_ids_raw:
+        path_crosswalk_ids = Path(raftsutil.resolve_fstrings(path_crosswalk_ids_raw, context))
+        if path_crosswalk_ids.exists():
+            logging.info(f"Applying crosswalk mapping from {path_crosswalk_ids}")
+            df_crosswalk = (pd.read_parquet(path_crosswalk_ids).astype(str) if str(path_crosswalk_ids).endswith('.parquet')
+                            else pd.read_csv(path_crosswalk_ids, dtype=str))
+            desired_id_col = raftsutil.get_crosswalk_target_col(df_crosswalk, pred_gpkg_id_col_local, crosswalk_target_col)
+            if not desired_id_col:
+                logging.error(f"Crosswalk file missing the specified pred_gpkg_id_col: {pred_gpkg_id_col_local}")
+        else:
+            logging.error(f"Crosswalk file path was provided but does not exist: {path_crosswalk_ids}")
+
     # =========================================================================
     # Process Datasets and Write Tables
     # =========================================================================
@@ -147,7 +167,7 @@ if __name__ == "__main__":
             for resp_var in resp_vars:
                 accumulated_by_algo = {}  # algo -> list of (df_params, is_mapped)
 
-                for region_id, region_spec in region_loop:
+                for region_id, _ in region_loop:  # region_spec unused here; only per-region output paths matter
                     dirs_std_dict_r = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=region_scheme)
                     dir_out_r = Path(dirs_std_dict_r.get('dir_out'))
                     dir_out_alg_ds_r = Path(dirs_std_dict_r.get('dir_out_alg_base')) / ds
@@ -249,7 +269,7 @@ if __name__ == "__main__":
                 id_col_pred = validated_pred_cfg.pred_file_comid_colname
                 region_results = []  # list of (df_compiled_params, current_id_col)
 
-                for region_id, region_spec in region_loop:
+                for region_id, _ in region_loop:  # region_spec unused here; only per-region output paths matter
                     dirs_std_dict_r = raftsutil.rafts_save_algo_dir_struct(dir_base, region=region_id, scheme=region_scheme)
                     dir_out_r = Path(dirs_std_dict_r.get('dir_out'))
                     dir_out_alg_ds_r = Path(dirs_std_dict_r.get('dir_out_alg_base')) / ds
@@ -284,39 +304,24 @@ if __name__ == "__main__":
                                          f"'{region_id}'. Skipping.")
                         continue
 
-                    # OPTIONAL CROSSWALK MAPPING
-                    path_crosswalk_ids_raw = validated_pred_cfg.path_crosswalk_ids
-                    pred_gpkg_id_col_local = validated_pred_cfg.pred_gpkg_id_col
+                    # OPTIONAL CROSSWALK MAPPING -- df_crosswalk/desired_id_col already
+                    # resolved once above, before the dataset loop.
+                    if desired_id_col:
+                        df_compiled_params[current_id_col] = df_compiled_params[current_id_col].astype(str)
 
-                    if path_crosswalk_ids_raw:
-                        path_crosswalk_ids = Path(raftsutil.resolve_fstrings(path_crosswalk_ids_raw, context))
-                        if path_crosswalk_ids.exists():
-                            logging.info(f"Applying crosswalk mapping from {path_crosswalk_ids}")
+                        df_compiled_params = df_compiled_params.merge(
+                            df_crosswalk, left_on=current_id_col, right_on=pred_gpkg_id_col_local, how='inner'
+                        )
 
-                            df_crosswalk = pd.read_parquet(path_crosswalk_ids).astype(str) if str(path_crosswalk_ids).endswith('.parquet') else pd.read_csv(path_crosswalk_ids, dtype=str)
+                        cols_to_drop = [current_id_col]
+                        if pred_gpkg_id_col_local in df_compiled_params.columns and pred_gpkg_id_col_local != desired_id_col:
+                            cols_to_drop.append(pred_gpkg_id_col_local)
 
-                            desired_id_col = raftsutil.get_crosswalk_target_col(df_crosswalk, pred_gpkg_id_col_local, crosswalk_target_col)
+                        df_compiled_params = df_compiled_params.drop(columns=cols_to_drop, errors='ignore')
+                        new_col_order = [desired_id_col] + [c for c in df_compiled_params.columns if c != desired_id_col]
+                        df_compiled_params = df_compiled_params[new_col_order]
 
-                            if desired_id_col:
-                                df_compiled_params[current_id_col] = df_compiled_params[current_id_col].astype(str)
-
-                                df_compiled_params = df_compiled_params.merge(
-                                    df_crosswalk, left_on=current_id_col, right_on=pred_gpkg_id_col_local, how='inner'
-                                )
-
-                                cols_to_drop = [current_id_col]
-                                if pred_gpkg_id_col_local in df_compiled_params.columns and pred_gpkg_id_col_local != desired_id_col:
-                                    cols_to_drop.append(pred_gpkg_id_col_local)
-
-                                df_compiled_params = df_compiled_params.drop(columns=cols_to_drop, errors='ignore')
-                                new_col_order = [desired_id_col] + [c for c in df_compiled_params.columns if c != desired_id_col]
-                                df_compiled_params = df_compiled_params[new_col_order]
-
-                                current_id_col = desired_id_col
-                            else:
-                                logging.error(f"Crosswalk file missing the specified pred_gpkg_id_col: {pred_gpkg_id_col_local}")
-                        else:
-                            logging.error(f"Crosswalk file path was provided but does not exist: {path_crosswalk_ids}")
+                        current_id_col = desired_id_col
 
                     df_compiled_params['region_id'] = region_id if region_id else 'CONUS'
                     df_compiled_params['model_scope'] = raftsregions.read_model_scope_sidecar(
