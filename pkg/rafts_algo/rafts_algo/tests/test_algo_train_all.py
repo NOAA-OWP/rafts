@@ -843,6 +843,24 @@ class TestRaftsSaveAlgoDirStruct(unittest.TestCase):
             raftsutil.rafts_save_algo_dir_struct(dir_base + '/not_a_dir/')
         print("✅ rafts_save_algo_dir_struct creating directory structure for outputs passed.")
 
+    def test_rafts_save_algo_dir_struct_region_aware(self):
+        dir_base = tempfile.gettempdir()
+        rslt_unregioned = raftsutil.rafts_save_algo_dir_struct(dir_base)
+
+        # A region/scheme is only honored when BOTH are given -- a region with no scheme (or
+        # vice versa) must stay byte-identical to the unregioned call, never partially nest.
+        rslt_region_only = raftsutil.rafts_save_algo_dir_struct(dir_base, region='FL')
+        rslt_scheme_only = raftsutil.rafts_save_algo_dir_struct(dir_base, scheme='custom')
+        self.assertEqual(rslt_region_only['dir_out'], rslt_unregioned['dir_out'])
+        self.assertEqual(rslt_scheme_only['dir_out'], rslt_unregioned['dir_out'])
+
+        rslt_regioned = raftsutil.rafts_save_algo_dir_struct(dir_base, region='FL', scheme='custom')
+        expected_dir_out = Path(dir_base) / 'output' / 'regions' / 'custom' / 'FL'
+        self.assertEqual(rslt_regioned['dir_out'], expected_dir_out)
+        self.assertEqual(rslt_regioned['dir_out_alg_base'], expected_dir_out / 'trained_algorithms')
+        self.assertTrue(expected_dir_out.exists())
+        print("✅ rafts_save_algo_dir_struct region-aware nesting test passed.")
+
 class TestOpenResponseDataRafts(unittest.TestCase):
     dir_std_base = tempfile.gettempdir()
 

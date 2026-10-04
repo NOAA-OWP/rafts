@@ -1,7 +1,119 @@
-from typing import Any, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict, Optional, Tuple, List, Union, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 import numpy as np
 import re
+
+# %% Region Configuration Validation
+
+class RegionsConfig(BaseModel):
+    """Validates the optional `regions:` config block. Absent/None (the default on both
+    AlgoConfig.regions and PredConfig.regions) reproduces today's CONUS-wide, unregioned
+    behavior byte-for-byte -- every downstream consumer treats `scheme is None` as "run
+    exactly once, unregioned," never as an error.
+
+    :param scheme: Region-definition source. 'vpu'/'huc2'/'custom' all resolve via a
+        divide_id -> region_id crosswalk file plus the hydrofabric divides layer for
+        geometry (they differ only in who/what produces the crosswalk, not in mechanics).
+        'states' resolves a `states` column match, independent of the crosswalk mechanism
+        (see rafts_algo.regions.states_mask). None means no regions configured (degenerate
+        CONUS case). Defaults to None.
+    :type scheme: Optional[Literal['vpu', 'huc2', 'states', 'custom']]
+    :param ids: Subset of region identifiers to actually run, keyed against `region_id_col`
+        (vpu/huc2/custom) or the keys of `states` (states). None means every region the
+        source defines. Defaults to None.
+    :type ids: Optional[List[str]]
+    :param path_regions_crosswalk: Path (may use the same f-string placeholders as other
+        *_config path fields, e.g. '{home_dir}') to a CSV/Parquet crosswalk with at least
+        [divide_id_col, region_id_col] columns, one row per divide assigned to a sub-region.
+        This is a dedicated file for region partitioning ONLY -- deliberately separate from
+        PredConfig.path_crosswalk_ids, which maps divide_id to an aggregation unit (e.g.
+        huc12) for a wholly different purpose (attribute aggregation). Never read
+        divide_id<->region_id pairs out of path_crosswalk_ids, and never add a region_id
+        column to that file -- a divide's aggregation huc12 and its training sub-region are
+        independent facts that must be editable independently. Required when scheme is
+        'vpu', 'huc2', or 'custom'. Existence is checked in rafts_algo.regions.load_regions()
+        after f-string resolution, not here -- same idiom as PredConfig.path_hf_finl_gpkg.
+        Defaults to None.
+    :type path_regions_crosswalk: Optional[str]
+    :param divide_id_col: Column name holding the hydrofabric divide identifier, in both
+        `path_regions_crosswalk` and the `path_hf_finl_gpkg` divides layer. Defaults to
+        'divide_id' (matches PredConfig.map_divide_id_col's default).
+    :type divide_id_col: str
+    :param region_id_col: Column in `path_regions_crosswalk` holding the sub-region
+        identifier. Defaults to 'region_id'.
+    :type region_id_col: str
+    :param path_hf_finl_gpkg: Path to the hydrofabric GPKG providing divide geometry for the
+        crosswalk's entries (dissolved into each region's core polygon, then buffered).
+        Required whenever scheme is 'vpu', 'huc2', or 'custom'. Same field name/convention as
+        PredConfig.path_hf_finl_gpkg. Defaults to None.
+    :type path_hf_finl_gpkg: Optional[str]
+    :param layr_hf_finl_gpkg: Layer to read from `path_hf_finl_gpkg`. Defaults to 'divides'.
+    :type layr_hf_finl_gpkg: str
+    :param states: For scheme='states' only: {region_id: [2-letter state codes]}, same shape
+        as PredConfig.donor_map_states' dict form. Required when scheme='states'. Defaults
+        to None.
+    :type states: Optional[Dict[str, List[str]]]
+    :param donor_buffer_km: Kilometers to buffer each region's core geometry outward when
+        selecting eligible donors/training data beyond the crosswalk's explicit membership;
+        0 means donors are exactly the crosswalk's core set, no spatial extension. Buffering
+        always happens in `buffer_crs`, never a geographic CRS. Defaults to 0.0.
+    :type donor_buffer_km: float
+    :param buffer_crs: Equal-distance projected CRS to buffer in. Defaults to 'EPSG:5070'
+        (CONUS Albers Equal Area) -- deliberately not EPSG:3857, whose distance distortion
+        grows with latitude.
+    :type buffer_crs: str
+    :param min_train_gages: Minimum donor/training-gage count a region's buffered set must
+        reach before training proceeds normally; below this, `fallback` applies. Defaults to
+        1 (effectively no gate) -- set explicitly for real small-region protection.
+    :type min_train_gages: int
+    :param fallback: Policy when a region falls below `min_train_gages`: 'parent' trains
+        that region on the full global/CONUS donor pool instead (predictions stay scoped to
+        the region's own core); 'expand_buffer' widens `donor_buffer_km` and retries, falling
+        through to 'parent' if still short; 'skip' trains nothing for that region (its core
+        receivers surface as gaps in the region-coverage QA check). Defaults to 'skip'.
+    :type fallback: Literal['parent', 'expand_buffer', 'skip']
+    :param include_conus: Whether locations outside every configured region's core are
+        expected (an implicit catch-all) rather than a QA error. Defaults to True.
+    :type include_conus: bool
+    :param max_spa_dist_km: Optional maximum spatial distance (km) between a receiver and
+        its assigned donor in rafts_algo_train.assign_donors_to_receivers' attribute-space
+        pairing. None (default) preserves today's behavior exactly (no spatial term at all).
+    :type max_spa_dist_km: Optional[float]
+    """
+    scheme: Optional[Literal['vpu', 'huc2', 'states', 'custom']] = None
+    ids: Optional[List[str]] = None
+    path_regions_crosswalk: Optional[str] = None
+    divide_id_col: str = 'divide_id'
+    region_id_col: str = 'region_id'
+    path_hf_finl_gpkg: Optional[str] = None
+    layr_hf_finl_gpkg: str = 'divides'
+    states: Optional[Dict[str, List[str]]] = None
+    donor_buffer_km: float = 0.0
+    buffer_crs: str = 'EPSG:5070'
+    min_train_gages: int = 1
+    fallback: Literal['parent', 'expand_buffer', 'skip'] = 'skip'
+    include_conus: bool = True
+    max_spa_dist_km: Optional[float] = None
+
+    @model_validator(mode="after")
+    def validate_scheme_requirements(self) -> "RegionsConfig":
+        """Cross-field validation mirroring the scheme-specific requirements documented above.
+
+        :return: The validated model.
+        :rtype: RegionsConfig
+        """
+        if self.scheme in ('vpu', 'huc2', 'custom'):
+            if not self.path_regions_crosswalk or not self.path_hf_finl_gpkg:
+                raise ValueError(
+                    f"scheme='{self.scheme}' requires both path_regions_crosswalk and "
+                    f"path_hf_finl_gpkg.")
+        if self.scheme == 'states' and not self.states:
+            raise ValueError("scheme='states' requires a non-empty 'states' mapping.")
+        if self.donor_buffer_km < 0:
+            raise ValueError("donor_buffer_km must be >= 0.")
+        if self.min_train_gages < 1:
+            raise ValueError("min_train_gages must be >= 1.")
+        return self
 
 # %% ML Configuration Validation
 
@@ -55,6 +167,9 @@ class AlgoConfig(BaseModel):
         every candidate cluster count rather than only the best. Defaults
         to False.
     :type save_all_clusters: bool
+    :param regions: Optional sub-region configuration. None (default) means training runs
+        CONUS-wide exactly as before this field existed. See RegionsConfig.
+    :type regions: Optional[RegionsConfig]
     """
     task_type: str = 'regression'
     algorithms: Dict[str, Any]
@@ -71,6 +186,7 @@ class AlgoConfig(BaseModel):
     uncertainty: Optional[Dict[str, Any]] = None
     n_jobs: Optional[int] = 1
     save_all_clusters: bool = False
+    regions: Optional[RegionsConfig] = None
 
 class PredConfig(BaseModel):
     """Validates the out-of-sample prediction configuration YAML (pred_config).
@@ -167,6 +283,12 @@ class PredConfig(BaseModel):
     :param map_divide_id_col: Divide identifier column name. Defaults to
         'divide_id'.
     :type map_divide_id_col: str
+    :param regions: Optional sub-region configuration. None (default) means prediction,
+        pairing, and the final regionalization GPKG all run CONUS-wide exactly as before
+        this field existed. See RegionsConfig. Declared independently from AlgoConfig.regions
+        (same precedent as donor_map_states above) -- the two configs should agree for a
+        coherent workflow, but that isn't enforced across separate YAML files.
+    :type regions: Optional[RegionsConfig]
     """
     name_attr_config: str
     name_algo_config: str
@@ -199,6 +321,7 @@ class PredConfig(BaseModel):
     hf_fp_id_col: str = 'id'
     fp_toid_col: str = 'toid'
     map_divide_id_col: str = 'divide_id'
+    regions: Optional[RegionsConfig] = None
 
 # %% Pydantic model pipeline validation 
 
