@@ -590,6 +590,68 @@ def find_region_gaps(gdf_candidates: Union[gpd.GeoDataFrame, pd.DataFrame], regi
     return pd.DataFrame({id_col: gaps.index, 'severity': severity})
 
 
+#: RegionsConfig fields that define WHICH regions exist and what they contain -- these must
+#: match between AlgoConfig.regions (training-time scope) and PredConfig.regions
+#: (prediction-time scope), since a mismatch here means the two phases silently partition the
+#: hydrofabric differently. Deliberately excludes policy-only fields (donor_buffer_km,
+#: min_train_gages, fallback, include_conus, max_spa_dist_km) that may legitimately be tuned
+#: per-script without changing what a region_id actually identifies.
+_REGION_IDENTITY_FIELDS = (
+    'scheme', 'path_regions_crosswalk', 'path_hf_finl_gpkg', 'layr_hf_finl_gpkg',
+    'divide_id_col', 'region_id_col', 'ids', 'states',
+)
+
+
+def check_regions_config_consistency(
+        algo_regions_cfg: Union[RegionsConfig, dict, None],
+        pred_regions_cfg: Union[RegionsConfig, dict, None]) -> List[str]:
+    """Compare AlgoConfig.regions (the scope a model was trained under) against
+    PredConfig.regions (the scope predictions are being made under) and report any
+    disagreement in what a region_id actually identifies.
+
+    This is a pure comparison -- it never raises, and the caller decides what to do with the
+    returned messages (normally ``for msg in ...: logging.warning(msg)``), matching the
+    existing non-enforceable-across-files precedent `name_attr_config` already lives with
+    (see rafts_algo.regions module docstring / RegionsConfig's own docstring). Catching this
+    at config-parse time isn't possible since the two configs are validated independently by
+    design (AlgoConfig and PredConfig are separate files, often edited at different times); this
+    is the next-best thing -- a check any script that loads both can call before it relies on
+    `region_id` meaning the same thing on both sides.
+
+    :param algo_regions_cfg: The training-side ``regions:`` block (``AlgoConfig.regions``), a
+        raw dict, or None.
+    :type algo_regions_cfg: RegionsConfig | dict | None
+    :param pred_regions_cfg: The prediction-side ``regions:`` block (``PredConfig.regions``), a
+        raw dict, or None.
+    :type pred_regions_cfg: RegionsConfig | dict | None
+    :return: One human-readable warning per disagreement found. Empty if both sides are None,
+        both are unconfigured (``scheme`` is None on both), or every identity field matches.
+    :rtype: List[str]
+    """
+    algo_cfg = _as_regions_config(algo_regions_cfg)
+    pred_cfg = _as_regions_config(pred_regions_cfg)
+    algo_scheme = algo_cfg.scheme if algo_cfg else None
+    pred_scheme = pred_cfg.scheme if pred_cfg else None
+
+    if algo_scheme is None and pred_scheme is None:
+        return []
+    if algo_scheme is None or pred_scheme is None:
+        configured_side = 'PredConfig' if algo_scheme is None else 'AlgoConfig'
+        unconfigured_side = 'AlgoConfig' if algo_scheme is None else 'PredConfig'
+        return [f"regions config drift: {configured_side}.regions has scheme='"
+                f"{pred_scheme or algo_scheme}' but {unconfigured_side}.regions is unset "
+                f"(None) -- predictions and training will use different region scopes."]
+
+    messages = []
+    for field in _REGION_IDENTITY_FIELDS:
+        algo_val, pred_val = getattr(algo_cfg, field), getattr(pred_cfg, field)
+        if algo_val != pred_val:
+            messages.append(f"regions config drift: AlgoConfig.regions.{field}={algo_val!r} "
+                             f"!= PredConfig.regions.{field}={pred_val!r} -- region_id may not "
+                             f"mean the same thing at training time vs. prediction time.")
+    return messages
+
+
 def normalize_named_state_groups(states_cfg) -> dict:
     """Normalize a `donor_map_states`-shaped config value into ``{region_name: [state, ...]}``.
 

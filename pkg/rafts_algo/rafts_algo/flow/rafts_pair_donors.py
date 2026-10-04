@@ -90,6 +90,8 @@ if __name__ == "__main__":
 
 
     regions_cfg = validated_pred_cfg.regions  # None unless this config sets a `regions:` block
+    for msg in raftsregions.check_regions_config_consistency(validated_algo_cfg.regions, regions_cfg):
+        logging.warning(msg)
     region_loop = raftsregions.resolve_region_loop(regions_cfg, args.region, context=context)
     region_divide_id_col = regions_cfg.divide_id_col if regions_cfg else 'divide_id'
     region_scheme = regions_cfg.scheme if regions_cfg else None

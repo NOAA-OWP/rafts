@@ -448,5 +448,58 @@ class TestResolveRegionLoop(RegionsTestBase):
             raftsregions.resolve_region_loop(self.regions_cfg, cli_region_arg='nonexistent')
 
 
+class TestCheckRegionsConfigConsistency(RegionsTestBase):
+
+    def test_both_none_is_clean(self):
+        self.assertEqual(raftsregions.check_regions_config_consistency(None, None), [])
+
+    def test_both_unconfigured_scheme_is_clean(self):
+        unset = RegionsConfig()
+        self.assertEqual(raftsregions.check_regions_config_consistency(unset, unset), [])
+
+    def test_identical_configs_is_clean(self):
+        self.assertEqual(
+            raftsregions.check_regions_config_consistency(self.regions_cfg, self.regions_cfg), [])
+
+    def test_one_configured_one_unset_is_flagged(self):
+        messages = raftsregions.check_regions_config_consistency(self.regions_cfg, None)
+        self.assertEqual(len(messages), 1)
+        self.assertIn('AlgoConfig', messages[0])
+        self.assertIn('PredConfig', messages[0])
+
+        messages_reversed = raftsregions.check_regions_config_consistency(None, self.regions_cfg)
+        self.assertEqual(len(messages_reversed), 1)
+
+    def test_different_crosswalk_path_is_flagged(self):
+        other_cfg = RegionsConfig(
+            scheme='custom', path_regions_crosswalk='/some/other/crosswalk.csv',
+            path_hf_finl_gpkg=self.regions_cfg.path_hf_finl_gpkg)
+        messages = raftsregions.check_regions_config_consistency(self.regions_cfg, other_cfg)
+        self.assertEqual(len(messages), 1)
+        self.assertIn('path_regions_crosswalk', messages[0])
+
+    def test_different_scheme_is_flagged(self):
+        states_cfg = RegionsConfig(scheme='states', states={'FL': ['FL']})
+        messages = raftsregions.check_regions_config_consistency(self.regions_cfg, states_cfg)
+        self.assertTrue(any('scheme' in m for m in messages))
+
+    def test_policy_only_field_difference_is_not_flagged(self):
+        # min_train_gages/fallback/donor_buffer_km/max_spa_dist_km may legitimately differ
+        # between training and prediction phases without region_id meaning anything different.
+        tuned_cfg = self.regions_cfg.model_copy(
+            update={'min_train_gages': 50, 'fallback': 'parent', 'donor_buffer_km': 25.0,
+                    'max_spa_dist_km': 10.0})
+        self.assertEqual(
+            raftsregions.check_regions_config_consistency(self.regions_cfg, tuned_cfg), [])
+
+    def test_accepts_raw_dicts(self):
+        algo_dict = {'scheme': 'custom', 'path_regions_crosswalk': str(self.path_crosswalk),
+                     'path_hf_finl_gpkg': str(self.path_hf_gpkg)}
+        pred_dict = {'scheme': 'custom', 'path_regions_crosswalk': 'different.csv',
+                     'path_hf_finl_gpkg': str(self.path_hf_gpkg)}
+        messages = raftsregions.check_regions_config_consistency(algo_dict, pred_dict)
+        self.assertEqual(len(messages), 1)
+
+
 if __name__ == '__main__':
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
