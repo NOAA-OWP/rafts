@@ -17,6 +17,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 import geopandas as gpd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import zipfile
 from typing import Iterable
 import rafts_algo.utils as raftsutil
@@ -705,14 +707,16 @@ def gen_conus_basemap(dir_out_basemap:str | Path, # This should be the data_visu
     #     2024 Originally created
     #     2025-09-22, changed from using urlib to using requests to avoid SSL error, GL
 
-
-    #url = 'https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_500k.zip'
     path_zip_basemap = f'{dir_out_basemap}/cb_2018_us_state_500k.zip'
     path_shp_basemap = f'{dir_out_basemap}/{fn_basemap}'
 
     if not Path(path_zip_basemap).exists():
         logging.info("Downloading shapefile...")
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, verify=False)  # disable SSL verification
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        response = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        response.raise_for_status()
         with open(path_zip_basemap, "wb") as out_file:
             out_file.write(response.content)
         logging.info("Shapefile downloaded.")
