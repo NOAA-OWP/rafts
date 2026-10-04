@@ -232,8 +232,17 @@ if __name__ == "__main__":
                 # and rafts_proc_algo_pool.py's identical use of this structure.
                 gdf_comid_basin_rows = gdf_comid
 
-                # Subset to the gage ids only selected for training (just in case some predictions make it into dat_resp)
-                gdf_comid = gdf_comid[gdf_comid['gage_id'].astype(str).isin(dat_resp['gage_id'].values)]
+                # -- Subset to the gage ids only selected for training (just in case some predictions make it into dat_resp)
+                # Drop duplicate multi-part geometries for the same gage -- without this, a
+                # gage with N basin divides (one row per divide, per gdf_comid_basin_rows
+                # above) survives as N rows here too, and the xarray assignment below raises
+                # ValueError: conflicting sizes for dimension 'gage_id' (confirmed against
+                # real hfATLAS fixture data: this crashed unconditionally before this fix,
+                # unrelated to sub-regions). Mirrors rafts_proc_algo_pool.py's identical fix.
+                gdf_comid = gdf_comid.drop_duplicates(subset=['gage_id']).copy()
+                # Reorder gdf_comid so it perfectly matches dat_resp's coordinate order
+                gdf_comid = gdf_comid.set_index('gage_id').loc[dat_resp['gage_id'].values].reset_index()
+                # Safely assign to Xarray without size mismatches or scrambled indexing
                 dat_resp["comid"] = (("gage_id"), gdf_comid["comid"].astype(str).values)
 
                 # --- VALIDATION: GDF Comid ---
